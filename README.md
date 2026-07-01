@@ -45,11 +45,30 @@ Configuration is read from environment variables:
 | `OSM_DATA_PATH` | Local directory for OSM data | `./data` |
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
 
+## Data Storage
+
+Geocoder data is stored in PocketBase's main SQLite database (`pb_data/data.db`) using raw SQL tables, not PocketBase collections:
+
+- `geocoder_places` — the indexed place records
+- `geocoder_places_fts` — FTS5 virtual table for full-text address search
+
+These tables are created automatically on first startup by `internal/db/migrations.go`.
+
+## Initial Data Fetch
+
+On first startup, the app checks whether `geocoder_places` is empty. If it is, it automatically downloads the configured OSM extract and indexes it. You can also trigger a manual refresh at any time by running:
+
+```bash
+./geocoder-pb superuser upsert admin@example.com password  # optional, for admin access
+```
+
+There is currently no dedicated CLI command for refresh; the scheduler's `Refresh()` method can be invoked from a custom PocketBase command or hook. A future improvement could add a `./geocoder-pb geocoder:refresh` custom command.
+
 ## Usage
 
 ```bash
 # Build
-go build ./cmd/geocoder-pb
+go build .
 
 # Run
 ./geocoder-pb serve

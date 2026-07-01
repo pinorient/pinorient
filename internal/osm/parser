@@ -1,0 +1,138 @@
+package osm
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"runtime"
+	"time"
+
+	"github.com/qedus/osmpbf"
+
+	"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/sellography/geocoder-pb/internal/models"
+)
+
+// Parser reads OSM PBF data and indexes relevant places.
+type Parser struct {
+	geo *geocoder.Geocoder
+}
+
+// NewParser creates a new OSM parser.
+func NewParser(geo *geocoder.Geocoder) *Parser {
+	return &Parser{geo: geo}
+}
+
+// Parse reads OSM PBF data from r and indexes addressable places.
+func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
+	decoder := osmpbf.NewDecoder(r)
+	if err := decoder.Start(runtime.NumCPU()); err != nil {
+		return fmt.Errorf("failed to start osm decoder: %w", err)
+	}
+
+	var count int64
+	start := time.Now()
+	lastLog := time.Now()
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		v, err := decoder.Decode()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("decode error: %w", err)
+		}
+
+		switch obj := v.(type) {
+		case *osmpbf.Node:
+			place := nodeToPlace(obj)
+			if place != nil {
+				if err := p.geo.UpsertPlace(ctx, place); err != nil {
+					log.Printf("upsert node %d failed: %v", obj.ID, err)
+				}
+				count++
+			}
+		case *osmpbf.Way:
+			place := wayToPlace(obj)
+			if place != nil {
+				if err := p.geo.UpsertPlace(ctx, place); err != nil {
+					log.Printf("upsert way %d failed: %v", obj.ID, err)
+				}
+				count++
+			}
+		}
+
+		// Log progress every 30 seconds.
+		if time.Since(lastLog) > 30*time.Second {
+			elapsed := time.Since(start).Round(time.Second)
+			log.Printf("osm indexing: %d places indexed (%s elapsed)", count, elapsed)
+			lastLog = time.Now()
+		}
+	}
+
+	elapsed := time.Since(start).Round(time.Second)
+	log.Printf("osm indexing complete: %d places indexed in %s", count, elapsed)
+
+	return nil
+}
+
+func nodeToPlace(n *osmpbf.Node) *models.Place {
+	name := n.Tags["name"]
+	if name == "" {
+		return nil
+	}
+
+	return &models.Place{
+		ID:       fmt.Sprintf("node/%d", n.ID),
+		OSMID:    n.ID,
+		OSMType:  "node",
+		Name:     name,
+		Address:  firstTag(n.Tags, "addr:street", "street"),
+		City:     firstTag(n.Tags, "addr:city", "city"),
+		State:    firstTag(n.Tags, "addr:state", "state"),
+		Postcode: firstTag(n.Tags, "addr:postcode", "postcode"),
+		Country:  firstTag(n.Tags, "addr:country", "country"),
+		Lat:      n.Lat,
+		Lon:      n.Lon,
+		Class:    n.Tags["class"],
+		Type:     n.Tags["type"],
+	}
+}
+
+func wayToPlace(w *osmpbf.Way) *models.Place {
+	name := w.Tags["name"]
+	if name == "" {
+		return nil
+	}
+
+	// Ways do not carry coordinates directly in this library; centroid
+	// computation requires resolving referenced nodes. For the scaffold we
+	// store a placeholder and leave centroid resolution for a later pass.
+	return &models.Place{
+		ID:       fmt.Sprintf("way/%d", w.ID),
+		OSMID:    w.ID,
+		OSMType:  "way",
+		Name:     name,
+		Address:  firstTag(w.Tags, "addr:street", "street"),
+		City:     firstTag(w.Tags, "addr:city", "city"),
+		State:    firstTag(w.Tags, "addr:state", "state"),
+		Postcode: firstTag(w.Tags, "addr:postcode", "postcode"),
+		Country:  firstTag(w.Tags, "addr:country", "country"),
+		Class:    w.Tags["class"],
+		Type:     w.Tags["type"],
+	}
+}
+
+func firstTag(tags map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := tags[k]; ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}

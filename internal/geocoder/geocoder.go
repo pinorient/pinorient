@@ -2,6 +2,7 @@ package geocoder
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/pocketbase/dbx"
@@ -152,4 +153,22 @@ func (g *Geocoder) ClearIndex(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// Count returns the number of indexed places.
+func (g *Geocoder) Count(ctx context.Context) (int64, error) {
+	db := g.app.DB()
+	if db == nil {
+		return 0, fmt.Errorf("db is not available")
+	}
+
+	var count int64
+	if err := db.NewQuery("SELECT COUNT(*) FROM geocoder_places").Row(&count); err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("count failed: %w", err)
+	}
+
+	return count, nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -39,6 +40,22 @@ func (s *Scheduler) Start(ctx context.Context, app core.App) error {
 	return nil
 }
 
+// EnsureIndexed downloads and indexes OSM data if the places table is empty.
+func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
+	count, err := s.geo.Count(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check index count: %w", err)
+	}
+
+	if count > 0 {
+		app.Logger().Info("geocoder index already populated", "count", count)
+		return nil
+	}
+
+	app.Logger().Info("geocoder index empty; fetching OSM data...")
+	return s.Refresh(ctx)
+}
+
 // Refresh downloads the latest OSM extract and re-indexes places.
 func (s *Scheduler) Refresh(ctx context.Context) error {
 	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
@@ -46,8 +63,16 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 	}
 
 	path := filepath.Join(s.cfg.OSMDataPath, "us-latest.osm.pbf")
-	if err := downloadFile(ctx, s.cfg.OSMDataURL, path); err != nil {
-		return fmt.Errorf("failed to download osm data: %w", err)
+
+	// Skip download if the file already exists (useful for development).
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Printf("downloading osm data from %s...", s.cfg.OSMDataURL)
+		if err := downloadFile(ctx, s.cfg.OSMDataURL, path); err != nil {
+			return fmt.Errorf("failed to download osm data: %w", err)
+		}
+		log.Printf("osm data downloaded to %s", path)
+	} else {
+		log.Printf("using existing osm data at %s", path)
 	}
 
 	f, err := os.Open(path)
