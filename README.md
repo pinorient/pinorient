@@ -15,6 +15,9 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 - Reverse geocoding (`/api/geocoder/reverse?lat=...&lon=...`)
 - Domain-based access restriction with wildcard support (`*.mysite.com`)
 - Periodic OSM data refresh via cron expression
+- **Admin UI visibility** — geocoder data is stored in a PocketBase collection, viewable from the admin dashboard
+- **Batched imports** — OSM data is imported in transactional batches for performance
+- **Progress logging** — import progress is logged with record count, elapsed time, and throughput
 
 ## Project Structure
 
@@ -24,7 +27,7 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 ├── internal/
 │   ├── api/                # HTTP routes and middleware
 │   ├── config/             # Environment-based configuration
-│   ├── db/                 # SQLite migrations and schema
+│   ├── db/                 # Schema migrations (PocketBase collection + FTS5)
 │   ├── geocoder/           # Search / reverse / indexing logic
 │   ├── models/             # Data models
 │   └── osm/                # OSM PBF parsing and refresh scheduler
@@ -44,25 +47,44 @@ Configuration is read from environment variables:
 | `OSM_DATA_URL` | URL to fetch OSM PBF data | `https://download.geofabrik.de/north-america/us-latest.osm.pbf` |
 | `OSM_DATA_PATH` | Local directory for OSM data | `./data` |
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
+| `FORCE_REINDEX` | Force full re-import on startup (`true`/`1` to enable) | *(empty = disabled)* |
 
 ## Data Storage
 
-Geocoder data is stored in PocketBase's main SQLite database (`pb_data/data.db`) using raw SQL tables, not PocketBase collections:
+Geocoder data is stored in PocketBase's main SQLite database (`pb_data/data.db`):
 
-- `geocoder_places` — the indexed place records
-- `geocoder_places_fts` — FTS5 virtual table for full-text address search
+- `geocoder_places` — a **PocketBase collection** containing the indexed place records. This collection is visible and manageable from the PocketBase admin UI at `/_/collections/geocoder_places`.
+- `geocoder_places_fts` — an FTS5 virtual table for full-text address search. This is a raw SQL table (not a collection) because FTS5 virtual tables are not directly supported as PocketBase collection types. It is kept in sync with `geocoder_places` via SQL triggers.
 
-These tables are created automatically on first startup by `internal/db/migrations.go`.
+The schema is created automatically on first startup by `internal/db/migrations.go`.
 
 ## Initial Data Fetch
 
-On first startup, the app checks whether `geocoder_places` is empty. If it is, it automatically downloads the configured OSM extract and indexes it. You can also trigger a manual refresh at any time by running:
+On first startup, the app checks whether `geocoder_places` is empty. If it is, it automatically downloads the configured OSM extract and indexes it. The import runs in the background so the server starts immediately.
+
+### Recovering from Interrupted Imports
+
+If an import was interrupted (e.g. the process was killed), the index will be partially populated. On restart, the app sees existing records and skips indexing. To force a full re-import:
 
 ```bash
-./geocoder-pb superuser upsert admin@example.com password  # optional, for admin access
+FORCE_REINDEX=true ./geocoder-pb serve
 ```
 
-There is currently no dedicated CLI command for refresh; the scheduler's `Refresh()` method can be invoked from a custom PocketBase command or hook. A future improvement could add a `./geocoder-pb geocoder:refresh` custom command.
+This clears the existing index and re-imports all OSM data from the downloaded PBF file.
+
+### Import Performance
+
+The importer uses batched transactions (5,000 records per batch) for dramatically faster inserts compared to one-by-one inserts. Progress is logged every 50,000 records with count, elapsed time, and records/second throughput.
+
+## Admin Access
+
+To view and manage geocoder data from the PocketBase admin UI:
+
+```bash
+./geocoder-pb superuser upsert admin@example.com password
+```
+
+Then navigate to `http://127.0.0.1:8090/_/` and log in. The `geocoder_places` collection will appear in the collections list, where you can browse, search, and manage records.
 
 ## Usage
 

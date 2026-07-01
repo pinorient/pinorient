@@ -20,6 +20,11 @@ type Config struct {
 	// UpdateCron is a cron expression for periodic OSM data refresh.
 	// Leave empty to disable scheduled updates.
 	UpdateCron string
+
+	// ForceReindex forces a full re-import of OSM data on startup,
+	// even if the geocoder index is already populated.
+	// Useful for recovering from interrupted imports or schema changes.
+	ForceReindex bool
 }
 
 // Load reads configuration from environment variables.
@@ -29,6 +34,7 @@ func Load() *Config {
 		OSMDataURL:     getEnv("OSM_DATA_URL", "https://download.geofabrik.de/north-america/us-latest.osm.pbf"),
 		OSMDataPath:    getEnv("OSM_DATA_PATH", "./data"),
 		UpdateCron:     os.Getenv("UPDATE_CRON"),
+		ForceReindex:   getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
 	}
 }
 

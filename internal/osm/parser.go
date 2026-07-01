@@ -4,12 +4,19 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/qedus/osmpbf"
 
 	"github.com/sellography/geocoder-pb/internal/geocoder"
 	"github.com/sellography/geocoder-pb/internal/models"
 )
+
+// batchBufferSize is the number of places to buffer before flushing to the database.
+const batchBufferSize = 5000
+
+// progressInterval is how often (in records) to log import progress.
+const progressInterval = 50000
 
 // Parser reads OSM PBF data and indexes relevant places.
 type Parser struct {
@@ -22,14 +29,34 @@ func NewParser(geo *geocoder.Geocoder) *Parser {
 }
 
 // Parse reads OSM PBF data from r and indexes addressable places.
+// Places are buffered and inserted in batched transactions for performance.
 func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 	decoder := osmpbf.NewDecoder(r)
 	if err := decoder.Start(0); err != nil {
 		return fmt.Errorf("failed to start osm decoder: %w", err)
 	}
 
+	startTime := time.Now()
+	totalIndexed := 0
+	buffer := make([]*models.Place, 0, batchBufferSize)
+
+	flush := func() error {
+		if len(buffer) == 0 {
+			return nil
+		}
+
+		saved, err := p.geo.BatchUpsertPlaces(ctx, buffer, batchBufferSize)
+		if err != nil {
+			return err
+		}
+		totalIndexed += saved
+		buffer = buffer[:0] // reset buffer while keeping capacity
+		return nil
+	}
+
 	for {
 		if ctx.Err() != nil {
+			_ = flush() // try to flush before returning
 			return ctx.Err()
 		}
 
@@ -38,26 +65,51 @@ func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 			break
 		}
 		if err != nil {
+			_ = flush()
 			return fmt.Errorf("decode error: %w", err)
 		}
 
+		var place *models.Place
 		switch obj := v.(type) {
 		case *osmpbf.Node:
-			place := nodeToPlace(obj)
-			if place != nil {
-				if err := p.geo.UpsertPlace(ctx, place); err != nil {
+			place = nodeToPlace(obj)
+		case *osmpbf.Way:
+			place = wayToPlace(obj)
+		}
+
+		if place != nil {
+			buffer = append(buffer, place)
+
+			if len(buffer) >= batchBufferSize {
+				if err := flush(); err != nil {
 					return err
 				}
-			}
-		case *osmpbf.Way:
-			place := wayToPlace(obj)
-			if place != nil {
-				if err := p.geo.UpsertPlace(ctx, place); err != nil {
-					return err
+
+				// Log progress at regular intervals.
+				if totalIndexed%progressInterval < batchBufferSize {
+					p.geo.LogProgress(totalIndexed, startTime)
 				}
 			}
 		}
 	}
+
+	// Flush any remaining buffered places.
+	if err := flush(); err != nil {
+		return err
+	}
+
+	// Rebuild the FTS index to ensure all data is searchable.
+	p.geo.LogProgress(totalIndexed, startTime)
+	if err := p.geo.RebuildFTS(ctx); err != nil {
+		return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
+	}
+
+	elapsed := time.Since(startTime)
+	p.geo.AppLogger().Info("osm import complete",
+		"total_indexed", totalIndexed,
+		"elapsed", elapsed.Round(time.Second).String(),
+		"rate", fmt.Sprintf("%.0f/s", float64(totalIndexed)/elapsed.Seconds()),
+	)
 
 	return nil
 }
