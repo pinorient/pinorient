@@ -1,0 +1,39 @@
+# Binaries
+geocoder-pb
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work
+
+# Dependency directories
+vendor/
+
+# PocketBase data
+pb_data/
+
+# OSM data files
+*.osm.pbf
+*.osm.bz2
+*.osm.gz
+data/
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
