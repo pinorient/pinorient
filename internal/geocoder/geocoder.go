@@ -407,3 +407,120 @@ func (g *Geocoder) LogProgress(count int, startTime time.Time) {
 func (g *Geocoder) AppLogger() *slog.Logger {
 	return g.app.Logger()
 }
+
+// NodeCoord represents a node's OSM ID and coordinates for way centroid computation.
+type NodeCoord struct {
+OSMID int64
+Lat   float64
+Lon   float64
+}
+
+// CreateNodeCoordTable creates a temporary table for storing node coordinates.
+func (g *Geocoder) CreateNodeCoordTable(ctx context.Context) error {
+db := g.app.NonconcurrentDB()
+if db == nil {
+return fmt.Errorf("db is not available")
+}
+
+_, err := db.NewQuery(`CREATE TABLE IF NOT EXISTS _osm_node_coords (
+osm_id INTEGER PRIMARY KEY,
+lat REAL NOT NULL,
+lon REAL NOT NULL
+)`).Execute()
+if err != nil {
+return fmt.Errorf("failed to create node coord table: %w", err)
+}
+
+// Create index for faster lookups.
+_, _ = db.NewQuery("CREATE INDEX IF NOT EXISTS idx_node_coords_osm_id ON _osm_node_coords(osm_id)").Execute()
+
+return nil
+}
+
+// DropNodeCoordTable drops the temporary node coordinates table.
+func (g *Geocoder) DropNodeCoordTable(ctx context.Context) error {
+db := g.app.NonconcurrentDB()
+if db == nil {
+return fmt.Errorf("db is not available")
+}
+
+_, err := db.NewQuery("DROP TABLE IF EXISTS _osm_node_coords").Execute()
+if err != nil {
+return fmt.Errorf("failed to drop node coord table: %w", err)
+}
+
+return nil
+}
+
+// BatchInsertNodeCoords inserts node coordinates in batches.
+func (g *Geocoder) BatchInsertNodeCoords(ctx context.Context, coords []NodeCoord) error {
+db := g.app.NonconcurrentDB()
+if db == nil {
+return fmt.Errorf("db is not available")
+}
+
+txErr := g.app.RunInTransaction(func(txApp core.App) error {
+txDB := txApp.NonconcurrentDB()
+if txDB == nil {
+return fmt.Errorf("transaction db is not available")
+}
+
+query := `INSERT OR REPLACE INTO _osm_node_coords (osm_id, lat, lon) VALUES ({:osm_id}, {:lat}, {:lon})`
+
+for _, c := range coords {
+if _, err := txDB.NewQuery(query).Bind(dbx.Params{
+"osm_id": c.OSMID,
+"lat":    c.Lat,
+"lon":    c.Lon,
+}).Execute(); err != nil {
+return err
+}
+}
+
+return nil
+})
+
+if txErr != nil {
+return fmt.Errorf("batch insert node coords failed: %w", txErr)
+}
+
+return nil
+}
+
+// GetWayCentroid computes the centroid (average lat/lon) of a way from its node references.
+func (g *Geocoder) GetWayCentroid(ctx context.Context, nodeIDs []int64) (float64, float64, error) {
+if len(nodeIDs) == 0 {
+return 0, 0, fmt.Errorf("no node IDs provided")
+}
+
+db := g.app.DB()
+if db == nil {
+return 0, 0, fmt.Errorf("db is not available")
+}
+
+// Build a comma-separated list of node IDs for the IN clause.
+// Use parameterized query to avoid SQL injection.
+placeholders := make([]string, len(nodeIDs))
+params := make(dbx.Params, len(nodeIDs))
+for i, id := range nodeIDs {
+key := fmt.Sprintf("n%d", i)
+placeholders[i] = fmt.Sprintf("{:%s}", key)
+params[key] = id
+}
+
+query := fmt.Sprintf(
+"SELECT AVG(lat) as avg_lat, AVG(lon) as avg_lon FROM _osm_node_coords WHERE osm_id IN (%s)",
+strings.Join(placeholders, ", "),
+)
+
+var result struct {
+AvgLat float64 `db:"avg_lat"`
+AvgLon float64 `db:"avg_lon"`
+}
+
+if err := db.NewQuery(query).Bind(params).One(&result); err != nil {
+return 0, 0, fmt.Errorf("failed to get way centroid: %w", err)
+}
+
+return result.AvgLat, result.AvgLon, nil
+}
