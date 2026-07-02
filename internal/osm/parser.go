@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/qedus/osmpbf"
@@ -30,14 +33,32 @@ func NewParser(geo *geocoder.Geocoder) *Parser {
 
 // Parse reads OSM PBF data from r and indexes addressable places.
 // Places are buffered and inserted in batched transactions for performance.
+// Both named places and address-tagged features (buildings, address points)
+// are indexed to support street address autocomplete.
+//
+// FTS triggers are temporarily dropped during import to avoid per-row FTS
+// overhead, and the FTS index is rebuilt once at the end.
 func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
+	// Drop FTS triggers to speed up bulk inserts.
+	if err := p.geo.DropFTSTriggers(ctx); err != nil {
+		return fmt.Errorf("failed to drop FTS triggers: %w", err)
+	}
+	defer func() {
+		// Always try to recreate triggers.
+		if err := p.geo.CreateFTSTriggers(ctx); err != nil {
+			log.Printf("warning: failed to recreate FTS triggers: %v", err)
+		}
+	}()
+
 	decoder := osmpbf.NewDecoder(r)
-	if err := decoder.Start(0); err != nil {
+	// Use multiple goroutines for faster decoding.
+	if err := decoder.Start(runtime.NumCPU()); err != nil {
 		return fmt.Errorf("failed to start osm decoder: %w", err)
 	}
 
 	startTime := time.Now()
 	totalIndexed := 0
+	skipped := 0
 	buffer := make([]*models.Place, 0, batchBufferSize)
 
 	flush := func() error {
@@ -75,6 +96,9 @@ func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 			place = nodeToPlace(obj)
 		case *osmpbf.Way:
 			place = wayToPlace(obj)
+		default:
+			// Relations are not currently indexed.
+			continue
 		}
 
 		if place != nil {
@@ -87,9 +111,13 @@ func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 
 				// Log progress at regular intervals.
 				if totalIndexed%progressInterval < batchBufferSize {
-					p.geo.LogProgress(totalIndexed, startTime)
+					elapsed := time.Since(startTime)
+					log.Printf("osm import progress: indexed=%d skipped=%d elapsed=%s rate=%.0f/s",
+						totalIndexed, skipped, elapsed.Round(time.Second), float64(totalIndexed)/elapsed.Seconds())
 				}
 			}
+		} else {
+			skipped++
 		}
 	}
 
@@ -98,26 +126,69 @@ func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 		return err
 	}
 
-	// Rebuild the FTS index to ensure all data is searchable.
-	p.geo.LogProgress(totalIndexed, startTime)
+	// Rebuild the FTS index in one shot (much faster than per-row triggers).
+	elapsed := time.Since(startTime)
+	log.Printf("osm import: all records inserted, rebuilding FTS index... (indexed=%d skipped=%d elapsed=%s)",
+		totalIndexed, skipped, elapsed.Round(time.Second))
 	if err := p.geo.RebuildFTS(ctx); err != nil {
 		return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
 	}
 
-	elapsed := time.Since(startTime)
-	p.geo.AppLogger().Info("osm import complete",
-		"total_indexed", totalIndexed,
-		"elapsed", elapsed.Round(time.Second).String(),
-		"rate", fmt.Sprintf("%.0f/s", float64(totalIndexed)/elapsed.Seconds()),
-	)
+	log.Printf("osm import complete: indexed=%d skipped=%d elapsed=%s rate=%.0f/s",
+		totalIndexed, skipped, elapsed.Round(time.Second), float64(totalIndexed)/elapsed.Seconds())
 
 	return nil
 }
 
+// hasAddressTags checks if the tags contain address information.
+func hasAddressTags(tags map[string]string) bool {
+	for k := range tags {
+		if strings.HasPrefix(k, "addr:") {
+			return true
+		}
+	}
+	return false
+}
+
+// buildAddress constructs a display address string from addr: tags.
+func buildAddress(tags map[string]string) string {
+	var parts []string
+
+	housenumber := firstTag(tags, "addr:housenumber")
+	street := firstTag(tags, "addr:street")
+	if housenumber != "" && street != "" {
+		parts = append(parts, housenumber+" "+street)
+	} else if street != "" {
+		parts = append(parts, street)
+	} else if housenumber != "" {
+		parts = append(parts, housenumber)
+	}
+
+	return strings.Join(parts, ", ")
+}
+
+// nodeToPlace converts an OSM node to a Place if it has a name or address tags.
 func nodeToPlace(n *osmpbf.Node) *models.Place {
 	name := n.Tags["name"]
-	if name == "" {
+	hasAddr := hasAddressTags(n.Tags)
+
+	// Skip if neither a name nor address tags are present.
+	if name == "" && !hasAddr {
 		return nil
+	}
+
+	// For nodes with only address tags, build a name from the address.
+	if name == "" {
+		housenumber := firstTag(n.Tags, "addr:housenumber")
+		street := firstTag(n.Tags, "addr:street")
+		if housenumber != "" && street != "" {
+			name = housenumber + " " + street
+		} else if street != "" {
+			name = street
+		} else {
+			// Has addr: tags but not street/housenumber — skip.
+			return nil
+		}
 	}
 
 	return &models.Place{
@@ -125,7 +196,7 @@ func nodeToPlace(n *osmpbf.Node) *models.Place {
 		OSMID:    n.ID,
 		OSMType:  "node",
 		Name:     name,
-		Address:  firstTag(n.Tags, "addr:street", "street"),
+		Address:  buildAddress(n.Tags),
 		City:     firstTag(n.Tags, "addr:city", "city"),
 		State:    firstTag(n.Tags, "addr:state", "state"),
 		Postcode: firstTag(n.Tags, "addr:postcode", "postcode"),
@@ -137,10 +208,28 @@ func nodeToPlace(n *osmpbf.Node) *models.Place {
 	}
 }
 
+// wayToPlace converts an OSM way to a Place if it has a name or address tags.
 func wayToPlace(w *osmpbf.Way) *models.Place {
 	name := w.Tags["name"]
-	if name == "" {
+	hasAddr := hasAddressTags(w.Tags)
+
+	// Skip if neither a name nor address tags are present.
+	if name == "" && !hasAddr {
 		return nil
+	}
+
+	// For ways with only address tags, build a name from the address.
+	if name == "" {
+		housenumber := firstTag(w.Tags, "addr:housenumber")
+		street := firstTag(w.Tags, "addr:street")
+		if housenumber != "" && street != "" {
+			name = housenumber + " " + street
+		} else if street != "" {
+			name = street
+		} else {
+			// Has addr: tags but not street/housenumber — skip.
+			return nil
+		}
 	}
 
 	// Ways do not carry coordinates directly in this library; centroid
@@ -151,7 +240,7 @@ func wayToPlace(w *osmpbf.Way) *models.Place {
 		OSMID:    w.ID,
 		OSMType:  "way",
 		Name:     name,
-		Address:  firstTag(w.Tags, "addr:street", "street"),
+		Address:  buildAddress(w.Tags),
 		City:     firstTag(w.Tags, "addr:city", "city"),
 		State:    firstTag(w.Tags, "addr:state", "state"),
 		Postcode: firstTag(w.Tags, "addr:postcode", "postcode"),

@@ -17,6 +17,7 @@ func RegisterRoutes(e *core.ServeEvent, geo *geocoder.Geocoder, cfg *config.Conf
 	g := e.Router.Group("/api/geocoder")
 	g.BindFunc(domainRestrictionMiddleware(cfg.AllowedDomains))
 	g.GET("/search", searchHandler(geo))
+	g.GET("/autocomplete", autocompleteHandler(geo))
 	g.GET("/reverse", reverseHandler(geo))
 }
 
@@ -31,6 +32,29 @@ func searchHandler(geo *geocoder.Geocoder) func(e *core.RequestEvent) error {
 		results, err := geo.Search(c.Request.Context(), q, limit)
 		if err != nil {
 			return c.InternalServerError("search failed", err)
+		}
+
+		return c.JSON(http.StatusOK, map[string]any{
+			"query":   q,
+			"results": results,
+		})
+	}
+}
+
+func autocompleteHandler(geo *geocoder.Geocoder) func(e *core.RequestEvent) error {
+	return func(c *core.RequestEvent) error {
+		q := strings.TrimSpace(c.Request.URL.Query().Get("q"))
+		if q == "" {
+			return c.JSON(http.StatusOK, map[string]any{
+				"query":   q,
+				"results": []any{},
+			})
+		}
+
+		limit, _ := strconv.Atoi(c.Request.URL.Query().Get("limit"))
+		results, err := geo.Autocomplete(c.Request.Context(), q, limit)
+		if err != nil {
+			return c.InternalServerError("autocomplete failed", err)
 		}
 
 		return c.JSON(http.StatusOK, map[string]any{

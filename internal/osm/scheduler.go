@@ -47,12 +47,17 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 		return fmt.Errorf("failed to check index count: %w", err)
 	}
 
-	if count > 0 {
+	if count > 0 && !s.cfg.ForceReindex {
 		app.Logger().Info("geocoder index already populated", "count", count)
 		return nil
 	}
 
-	app.Logger().Info("geocoder index empty; fetching OSM data...")
+	if s.cfg.ForceReindex {
+		app.Logger().Info("force reindex enabled; re-importing OSM data...", "current_count", count)
+	} else {
+		app.Logger().Info("geocoder index empty; fetching OSM data...")
+	}
+
 	return s.Refresh(ctx)
 }
 

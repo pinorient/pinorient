@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/pocketbase/dbx"
@@ -57,6 +58,67 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int) ([]models.Pl
 	}
 
 	return places, nil
+}
+
+// Autocomplete performs a prefix-based search for autocomplete suggestions.
+// It uses FTS5 prefix matching (e.g., "cal*" matches "Calico", "California").
+// The query is tokenized and each token gets a * suffix for prefix matching.
+func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int) ([]models.Place, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
+	db := g.app.DB()
+	if db == nil {
+		return nil, fmt.Errorf("db is not available")
+	}
+
+	// Build FTS5 prefix query: "1600 pen*" -> "1600* pen*"
+	ftsQuery := buildPrefixQuery(q)
+	if ftsQuery == "" {
+		return []models.Place{}, nil
+	}
+
+	query := `
+		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
+		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
+		       p.created, p.updated
+		FROM geocoder_places p
+		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
+		WHERE geocoder_places_fts MATCH {:query}
+		ORDER BY rank
+		LIMIT {:limit}
+	`
+
+	var places []models.Place
+	if err := db.
+		NewQuery(query).
+		Bind(dbx.Params{"query": ftsQuery, "limit": limit}).
+		All(&places); err != nil {
+		return nil, fmt.Errorf("autocomplete failed: %w", err)
+	}
+
+	return places, nil
+}
+
+// buildPrefixQuery converts a user query into an FTS5 prefix query.
+// e.g., "1600 penn" -> "1600* penn*"
+func buildPrefixQuery(q string) string {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return ""
+	}
+
+	// Split on whitespace and add * suffix to each token.
+	tokens := strings.Fields(q)
+	for i, token := range tokens {
+		// Don't add * if the token already ends with *.
+		if !strings.HasSuffix(token, "*") {
+			tokens[i] = token + "*"
+		}
+	}
+
+	return strings.Join(tokens, " AND ")
 }
 
 // Reverse performs a reverse geocoding lookup for the given coordinates.
@@ -263,6 +325,57 @@ func (g *Geocoder) Count(ctx context.Context) (int64, error) {
 	}
 
 	return count, nil
+}
+
+// DropFTSTriggers drops the FTS5 sync triggers to speed up bulk inserts.
+// Remember to call CreateFTSTriggers and RebuildFTS afterwards.
+func (g *Geocoder) DropFTSTriggers(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	triggers := []string{"places_fts_insert", "places_fts_delete", "places_fts_update"}
+	for _, t := range triggers {
+		if _, err := db.NewQuery(fmt.Sprintf("DROP TRIGGER IF EXISTS %s", t)).Execute(); err != nil {
+			return fmt.Errorf("failed to drop trigger %s: %w", t, err)
+		}
+	}
+
+	return nil
+}
+
+// CreateFTSTriggers recreates the FTS5 sync triggers after bulk imports.
+func (g *Geocoder) CreateFTSTriggers(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	triggers := []string{
+		`CREATE TRIGGER IF NOT EXISTS places_fts_insert AFTER INSERT ON geocoder_places BEGIN
+			INSERT INTO geocoder_places_fts(rowid, name, address, city, state, postcode)
+			VALUES (new.rowid, new.name, new.address, new.city, new.state, new.postcode);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS places_fts_delete AFTER DELETE ON geocoder_places BEGIN
+			INSERT INTO geocoder_places_fts(geocoder_places_fts, rowid, name, address, city, state, postcode)
+			VALUES ('delete', old.rowid, old.name, old.address, old.city, old.state, old.postcode);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS places_fts_update AFTER UPDATE ON geocoder_places BEGIN
+			INSERT INTO geocoder_places_fts(geocoder_places_fts, rowid, name, address, city, state, postcode)
+			VALUES ('delete', old.rowid, old.name, old.address, old.city, old.state, old.postcode);
+			INSERT INTO geocoder_places_fts(rowid, name, address, city, state, postcode)
+			VALUES (new.rowid, new.name, new.address, new.city, new.state, new.postcode);
+		END`,
+	}
+
+	for _, sql := range triggers {
+		if _, err := db.NewQuery(sql).Execute(); err != nil {
+			return fmt.Errorf("failed to create FTS trigger: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // RebuildFTS rebuilds the FTS5 index from the existing geocoder_places data.
