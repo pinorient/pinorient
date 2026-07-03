@@ -45,6 +45,13 @@ func main() {
 			}
 		}()
 
+		// Index TIGER/Line address data in the background for address interpolation.
+		go func() {
+			if err := scheduler.EnsureTigerIndexed(context.Background(), app); err != nil {
+				app.Logger().Error("tiger indexing failed", "error", err)
+			}
+		}()
+
 		if cfg.UpdateCron != "" {
 			if err := scheduler.Start(context.Background(), app); err != nil {
 				return err

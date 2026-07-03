@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,7 +41,36 @@ func New(app core.App, cfg *config.Config) *Geocoder {
 	return &Geocoder{app: app, cfg: cfg}
 }
 
+// parseHouseNumber attempts to extract a leading house number from a query.
+// Returns the house number, the remaining street name, and true if a house
+// number was found. e.g., "42 Maple St" -> (42, "Maple St", true).
+func parseHouseNumber(q string) (int, string, bool) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return 0, "", false
+	}
+
+	tokens := strings.Fields(q)
+	if len(tokens) < 2 {
+		return 0, "", false
+	}
+
+	n, err := strconv.Atoi(tokens[0])
+	if err != nil || n <= 0 {
+		return 0, "", false
+	}
+
+	streetName := strings.Join(tokens[1:], " ")
+	if streetName == "" {
+		return 0, "", false
+	}
+
+	return n, streetName, true
+}
+
 // Search performs a geocoding search for the given query.
+// If the query starts with a house number, TIGER/Line address interpolation
+// is attempted first to fill coverage gaps. Results from OSM FTS are also included.
 // If bbox is provided and valid, results are filtered to the bounding box.
 func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) ([]models.Place, error) {
 	if limit <= 0 {
@@ -52,13 +82,27 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		return nil, fmt.Errorf("db is not available")
 	}
 
+	var places []models.Place
+
+	// Try TIGER address interpolation if the query starts with a house number.
+	if houseNum, streetName, ok := parseHouseNumber(q); ok {
+		if tigerPlace, err := g.InterpolateAddress(ctx, houseNum, streetName); err == nil && tigerPlace != nil {
+			// Apply bbox filter to TIGER result if needed.
+			if bbox == nil || !bbox.Valid() ||
+				(tigerPlace.Lat >= bbox.MinLat && tigerPlace.Lat <= bbox.MaxLat &&
+					tigerPlace.Lon >= bbox.MinLng && tigerPlace.Lon <= bbox.MaxLng) {
+				places = append(places, *tigerPlace)
+			}
+		}
+	}
+
 	// Use FTS5 to match the query across indexed fields.
 	// When a bbox is provided, add a coordinate filter.
 	bboxClause := ""
 	params := dbx.Params{"query": q, "limit": limit}
 	if bbox != nil && bbox.Valid() {
 		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
-			       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
+		       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
 		params["min_lat"] = bbox.MinLat
 		params["max_lat"] = bbox.MaxLat
 		params["min_lng"] = bbox.MinLng
@@ -77,12 +121,17 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		LIMIT {:limit}
 	`, bboxClause)
 
-	var places []models.Place
+	var osmPlaces []models.Place
 	if err := db.
 		NewQuery(query).
 		Bind(params).
-		All(&places); err != nil {
+		All(&osmPlaces); err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
+	}
+
+	places = append(places, osmPlaces...)
+	if len(places) > limit {
+		places = places[:limit]
 	}
 
 	return places, nil
@@ -113,7 +162,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 	params := dbx.Params{"query": ftsQuery, "limit": limit}
 	if bbox != nil && bbox.Valid() {
 		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
-			       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
+		       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
 		params["min_lat"] = bbox.MinLat
 		params["max_lat"] = bbox.MaxLat
 		params["min_lng"] = bbox.MinLng
@@ -617,4 +666,163 @@ func (g *Geocoder) GetWayCentroid(ctx context.Context, nodeIDs []int64) (float64
 	}
 
 	return result.AvgLat, result.AvgLon, nil
+}
+
+// AddrRange represents a TIGER/Line address range record.
+type AddrRange struct {
+	FullName string  // Street name (e.g., "Maple St")
+	FromHN   int     // From house number
+	ToHN     int     // To house number
+	Parity   string  // "E" (even) or "O" (odd)
+	ZIP      string  // ZIP code
+	Side     string  // "L" (left) or "R" (right)
+	Lat      float64 // Midpoint latitude
+	Lon      float64 // Midpoint longitude
+}
+
+// HasTigerAddrRanges returns true if the tiger_addr_ranges table has any data.
+func (g *Geocoder) HasTigerAddrRanges(ctx context.Context) (bool, error) {
+	db := g.app.DB()
+	if db == nil {
+		return false, fmt.Errorf("db is not available")
+	}
+
+	var hasRows int
+	if err := db.NewQuery("SELECT EXISTS(SELECT 1 FROM tiger_addr_ranges LIMIT 1)").Row(&hasRows); err != nil {
+		return false, fmt.Errorf("failed to check tiger addr ranges: %w", err)
+	}
+	return hasRows == 1, nil
+}
+
+// RebuildTigerFTS rebuilds the TIGER FTS5 index from the tiger_addr_ranges table.
+func (g *Geocoder) RebuildTigerFTS(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	if _, err := db.NewQuery("INSERT INTO tiger_addr_fts(tiger_addr_fts) VALUES('rebuild')").Execute(); err != nil {
+		return fmt.Errorf("rebuild TIGER FTS failed: %w", err)
+	}
+	return nil
+}
+
+// InterpolateAddress looks up a house number on a named street in TIGER data
+// and returns interpolated coordinates. Returns nil if no match is found.
+func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string) (*models.Place, error) {
+	db := g.app.DB()
+	if db == nil {
+		return nil, fmt.Errorf("db is not available")
+	}
+
+	// Determine parity (odd/even) of the house number.
+	parity := "O"
+	if houseNumber%2 == 0 {
+		parity = "E"
+	}
+
+	// Find the matching address range using FTS on full_name.
+	// We search for the street name, then filter by house number range and parity.
+	query := `
+		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
+		FROM tiger_addr_ranges t
+		WHERE t.full_name = {:street}
+		  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
+		  AND t.parity = {:parity}
+		LIMIT 1
+	`
+
+	var ar struct {
+		FullName string  `db:"full_name"`
+		FromHN   int     `db:"from_hn"`
+		ToHN     int     `db:"to_hn"`
+		Parity   string  `db:"parity"`
+		ZIP      string  `db:"zip"`
+		Side     string  `db:"side"`
+		Lat      float64 `db:"lat"`
+		Lon      float64 `db:"lon"`
+	}
+
+	if err := db.NewQuery(query).Bind(dbx.Params{
+		"street": streetName,
+		"hn":     houseNumber,
+		"parity": parity,
+	}).One(&ar); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("tiger address lookup failed: %w", err)
+	}
+
+	// Use the stored segment midpoint as the interpolated coordinate.
+	place := &models.Place{
+		ID:       fmt.Sprintf("tiger-%d-%s", houseNumber, streetName),
+		Name:     fmt.Sprintf("%d %s", houseNumber, streetName),
+		Address:  fmt.Sprintf("%d %s", houseNumber, streetName),
+		Postcode: ar.ZIP,
+		Country:  "US",
+		Lat:      ar.Lat,
+		Lon:      ar.Lon,
+		Class:    "highway",
+		Type:     "residential",
+	}
+
+	return place, nil
+}
+
+// BatchUpsertAddrRanges inserts or updates TIGER/Line address ranges in batches.
+func (g *Geocoder) BatchUpsertAddrRanges(ctx context.Context, ranges []*AddrRange, batchSize int) (int, error) {
+	if batchSize <= 0 {
+		batchSize = 5000
+	}
+
+	saved := 0
+	for i := 0; i < len(ranges); i += batchSize {
+		if ctx.Err() != nil {
+			return saved, ctx.Err()
+		}
+
+		end := i + batchSize
+		if end > len(ranges) {
+			end = len(ranges)
+		}
+		batch := ranges[i:end]
+
+		txErr := g.app.RunInTransaction(func(txApp core.App) error {
+			txDB := txApp.NonconcurrentDB()
+			if txDB == nil {
+				return fmt.Errorf("transaction db is not available")
+			}
+
+			query := `INSERT INTO tiger_addr_ranges (full_name, from_hn, to_hn, parity, zip, side, lat, lon)
+				VALUES ({:full_name}, {:from_hn}, {:to_hn}, {:parity}, {:zip}, {:side}, {:lat}, {:lon})
+				ON CONFLICT(full_name, from_hn, to_hn, side) DO UPDATE SET
+					parity = excluded.parity, zip = excluded.zip, lat = excluded.lat, lon = excluded.lon`
+
+			for _, ar := range batch {
+				if _, err := txDB.NewQuery(query).Bind(dbx.Params{
+					"full_name": ar.FullName,
+					"from_hn":   ar.FromHN,
+					"to_hn":     ar.ToHN,
+					"parity":    ar.Parity,
+					"zip":       ar.ZIP,
+					"side":      ar.Side,
+					"lat":       ar.Lat,
+					"lon":       ar.Lon,
+				}).Execute(); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		})
+
+		if txErr != nil {
+			return saved, fmt.Errorf("batch upsert addr ranges failed at offset %d: %w", i, txErr)
+		}
+
+		saved += len(batch)
+	}
+
+	return saved, nil
 }

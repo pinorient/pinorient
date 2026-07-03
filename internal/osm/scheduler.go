@@ -1,6 +1,7 @@
 package osm
 
 import (
+	"archive/zip"
 	"context"
 	"fmt"
 	"io"
@@ -8,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pocketbase/pocketbase/core"
 
 	"github.com/sellography/geocoder-pb/internal/config"
 	"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/sellography/geocoder-pb/internal/tiger"
 )
 
 // Scheduler handles periodic OSM data refresh.
@@ -68,6 +71,86 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 
 	// Everything is already populated.
 	app.Logger().Info("geocoder index already populated")
+	return nil
+}
+
+// EnsureTigerIndexed downloads and imports TIGER/Line address range data
+// for the configured counties if the tiger_addr_ranges table is empty.
+func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error {
+	if len(s.cfg.TIGERCounties) == 0 {
+		return nil
+	}
+
+	// Check if TIGER data already exists.
+	hasTiger, err := s.geo.HasTigerAddrRanges(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check TIGER addr ranges: %w", err)
+	}
+
+	if hasTiger && !s.cfg.TIGERForceReimport {
+		app.Logger().Info("TIGER addr ranges already populated")
+		return nil
+	}
+
+	app.Logger().Info("importing TIGER/Line address data", "counties", s.cfg.TIGERCounties)
+	if err := s.ImportTiger(ctx, app); err != nil {
+		return fmt.Errorf("TIGER import failed: %w", err)
+	}
+	app.Logger().Info("TIGER/Line import complete")
+	return nil
+}
+
+// ImportTiger downloads and imports TIGER/Line ADDRFEAT shapefiles for all configured counties.
+func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
+	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
+		return fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	tigerDir := filepath.Join(s.cfg.OSMDataPath, "tiger")
+	if err := os.MkdirAll(tigerDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create tiger data directory: %w", err)
+	}
+
+	for _, fips := range s.cfg.TIGERCounties {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		zipPath := filepath.Join(tigerDir, fmt.Sprintf("tl_%s_%s_addrfeat.zip", s.cfg.TIGERYear, fips))
+		extractDir := filepath.Join(tigerDir, fips)
+
+		// Download the ZIP if it doesn't exist.
+		if _, err := os.Stat(zipPath); os.IsNotExist(err) {
+			url := fmt.Sprintf("https://www2.census.gov/geo/tiger/TIGER%s/ADDRFEAT/tl_%s_%s_addrfeat.zip",
+				s.cfg.TIGERYear, s.cfg.TIGERYear, fips)
+			log.Printf("downloading TIGER/Line data from %s...", url)
+			if err := downloadFile(ctx, url, zipPath); err != nil {
+				return fmt.Errorf("failed to download TIGER data for county %s: %w", fips, err)
+			}
+			log.Printf("TIGER/Line data downloaded for county %s", fips)
+		} else {
+			log.Printf("using existing TIGER/Line data for county %s", fips)
+		}
+
+		// Extract the ZIP if the directory doesn't exist.
+		if _, err := os.Stat(extractDir); os.IsNotExist(err) {
+			if err := unzipFile(zipPath, extractDir); err != nil {
+				return fmt.Errorf("failed to unzip TIGER data for county %s: %w", fips, err)
+			}
+		}
+
+		// Parse and import the shapefile.
+		parser := tiger.NewParser(s.geo)
+		if err := parser.ParseDir(ctx, extractDir); err != nil {
+			return fmt.Errorf("failed to parse TIGER data for county %s: %w", fips, err)
+		}
+	}
+
+	// Rebuild the TIGER FTS index after import.
+	if err := s.geo.RebuildTigerFTS(ctx); err != nil {
+		app.Logger().Warn("failed to rebuild TIGER FTS index", "error", err)
+	}
+
 	return nil
 }
 
@@ -132,4 +215,56 @@ func downloadFile(ctx context.Context, url, path string) error {
 
 	_, err = io.Copy(out, resp.Body)
 	return err
+}
+
+// unzipFile extracts a ZIP archive to the target directory.
+func unzipFile(zipPath, destDir string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open zip: %w", err)
+	}
+	defer r.Close()
+
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return err
+	}
+
+	for _, f := range r.File {
+		// Prevent Zip Slip vulnerability.
+		fpath := filepath.Join(destDir, f.Name)
+		if !strings.HasPrefix(fpath, filepath.Clean(destDir)+string(os.PathSeparator)) {
+			return fmt.Errorf("illegal file path in zip: %s", f.Name)
+		}
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(fpath, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(fpath), 0o755); err != nil {
+			return err
+		}
+
+		outFile, err := os.OpenFile(fpath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
+		if err != nil {
+			return err
+		}
+
+		rc, err := f.Open()
+		if err != nil {
+			outFile.Close()
+			return err
+		}
+
+		_, err = io.Copy(outFile, rc)
+		outFile.Close()
+		rc.Close()
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

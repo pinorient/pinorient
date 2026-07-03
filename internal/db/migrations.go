@@ -101,6 +101,34 @@ func RunMigrations(app core.App) error {
 	//    after the server starts (see main.go). This prevents a hours-long
 	//    rebuild from blocking server startup.
 
+	// 5. Create the TIGER/Line address ranges table for address interpolation.
+	//    This is a raw SQL table (not a PocketBase collection) because it's
+	//    used internally by the geocoder for interpolation, not exposed via admin UI.
+	tigerQueries := []string{
+		`CREATE TABLE IF NOT EXISTS tiger_addr_ranges (
+			full_name TEXT NOT NULL,
+			from_hn INTEGER NOT NULL,
+			to_hn INTEGER NOT NULL,
+			parity TEXT NOT NULL,
+			zip TEXT,
+			side TEXT NOT NULL,
+			lat REAL NOT NULL,
+			lon REAL NOT NULL,
+			UNIQUE(full_name, from_hn, to_hn, side)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_full_name ON tiger_addr_ranges(full_name)`,
+		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_hn ON tiger_addr_ranges(from_hn, to_hn)`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS tiger_addr_fts USING fts5(
+			full_name,
+			content='tiger_addr_ranges'
+		)`,
+	}
+	for _, q := range tigerQueries {
+		if _, err := db.NewQuery(q).Execute(); err != nil {
+			return fmt.Errorf("tiger migration failed: %w", err)
+		}
+	}
+
 	return nil
 }
 
