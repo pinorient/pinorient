@@ -189,6 +189,23 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		return nil, fmt.Errorf("autocomplete failed: %w", err)
 	}
 
+	// Try TIGER address interpolation if the query starts with a house number.
+	// This fills coverage gaps for addresses that exist in TIGER but not OSM.
+	if houseNum, streetName, ok := parseHouseNumber(q); ok {
+		if tigerPlace, err := g.InterpolateAddress(ctx, houseNum, streetName); err == nil && tigerPlace != nil {
+			// Apply bbox filter to TIGER result if needed.
+			if bbox == nil || !bbox.Valid() ||
+				(tigerPlace.Lat >= bbox.MinLat && tigerPlace.Lat <= bbox.MaxLat &&
+					tigerPlace.Lon >= bbox.MinLng && tigerPlace.Lon <= bbox.MaxLng) {
+				// Prepend TIGER result so it appears first in autocomplete.
+				places = append([]models.Place{*tigerPlace}, places...)
+				if len(places) > limit {
+					places = places[:limit]
+				}
+			}
+		}
+	}
+
 	return places, nil
 }
 
@@ -707,8 +724,36 @@ func (g *Geocoder) RebuildTigerFTS(ctx context.Context) error {
 	return nil
 }
 
+// normalizeStreetName expands common abbreviations so that user queries like
+// "Maple Street" match TIGER data which uses "Maple St".
+func normalizeStreetName(name string) string {
+	name = strings.TrimSpace(name)
+	// Replace whole-word abbreviations (case-insensitive).
+	replacements := []struct{ full, abbr string }{
+		{"Street", "St"},
+		{"Avenue", "Ave"},
+		{"Boulevard", "Blvd"},
+		{"Drive", "Dr"},
+		{"Road", "Rd"},
+		{"Lane", "Ln"},
+		{"Court", "Ct"},
+		{"Place", "Pl"},
+		{"Circle", "Cir"},
+	}
+	words := strings.Fields(name)
+	for i, w := range words {
+		for _, r := range replacements {
+			if strings.EqualFold(w, r.full) {
+				words[i] = r.abbr
+			}
+		}
+	}
+	return strings.Join(words, " ")
+}
+
 // InterpolateAddress looks up a house number on a named street in TIGER data
 // and returns interpolated coordinates. Returns nil if no match is found.
+// Handles abbreviation differences (e.g., "Maple Street" matches "Maple St").
 func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string) (*models.Place, error) {
 	db := g.app.DB()
 	if db == nil {
@@ -721,16 +766,14 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		parity = "E"
 	}
 
-	// Find the matching address range using FTS on full_name.
-	// We search for the street name, then filter by house number range and parity.
-	query := `
-		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
-		FROM tiger_addr_ranges t
-		WHERE t.full_name = {:street}
-		  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
-		  AND t.parity = {:parity}
-		LIMIT 1
-	`
+	// Try exact match first, then fall back to normalized name, then LIKE prefix.
+	// This handles cases where the user types "Maple Street" but TIGER has "Maple St".
+	normalized := normalizeStreetName(streetName)
+	candidates := []string{streetName, normalized}
+	// Also try just the first word as a LIKE prefix (e.g., "Maple%" matches "Maple St").
+	if parts := strings.Fields(streetName); len(parts) > 0 {
+		candidates = append(candidates, parts[0])
+	}
 
 	var ar struct {
 		FullName string  `db:"full_name"`
@@ -743,31 +786,57 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		Lon      float64 `db:"lon"`
 	}
 
-	if err := db.NewQuery(query).Bind(dbx.Params{
-		"street": streetName,
-		"hn":     houseNumber,
-		"parity": parity,
-	}).One(&ar); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, nil
+	for i, candidate := range candidates {
+		var query string
+		var params dbx.Params
+
+		if i < 2 {
+			// Exact match for original and normalized names.
+			query = `
+				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
+				FROM tiger_addr_ranges t
+				WHERE t.full_name = {:street}
+				  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
+				  AND t.parity = {:parity}
+				LIMIT 1
+			`
+			params = dbx.Params{"street": candidate, "hn": houseNumber, "parity": parity}
+		} else {
+			// LIKE prefix match as fallback (e.g., "Maple%" matches "Maple St").
+			query = `
+				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
+				FROM tiger_addr_ranges t
+				WHERE t.full_name LIKE {:prefix} || '%'
+				  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
+				  AND t.parity = {:parity}
+				LIMIT 1
+			`
+			params = dbx.Params{"prefix": candidate, "hn": houseNumber, "parity": parity}
 		}
-		return nil, fmt.Errorf("tiger address lookup failed: %w", err)
+
+		if err := db.NewQuery(query).Bind(params).One(&ar); err != nil {
+			if err == sql.ErrNoRows {
+				continue // Try next candidate.
+			}
+			return nil, fmt.Errorf("tiger address lookup failed: %w", err)
+		}
+
+		// Found a match — build the result.
+		place := &models.Place{
+			ID:       fmt.Sprintf("tiger-%d-%s", houseNumber, ar.FullName),
+			Name:     fmt.Sprintf("%d %s", houseNumber, ar.FullName),
+			Address:  fmt.Sprintf("%d %s", houseNumber, ar.FullName),
+			Postcode: ar.ZIP,
+			Country:  "US",
+			Lat:      ar.Lat,
+			Lon:      ar.Lon,
+			Class:    "highway",
+			Type:     "residential",
+		}
+		return place, nil
 	}
 
-	// Use the stored segment midpoint as the interpolated coordinate.
-	place := &models.Place{
-		ID:       fmt.Sprintf("tiger-%d-%s", houseNumber, streetName),
-		Name:     fmt.Sprintf("%d %s", houseNumber, streetName),
-		Address:  fmt.Sprintf("%d %s", houseNumber, streetName),
-		Postcode: ar.ZIP,
-		Country:  "US",
-		Lat:      ar.Lat,
-		Lon:      ar.Lon,
-		Class:    "highway",
-		Type:     "residential",
-	}
-
-	return place, nil
+	return nil, nil // No match found.
 }
 
 // BatchUpsertAddrRanges inserts or updates TIGER/Line address ranges in batches.
