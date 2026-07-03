@@ -420,6 +420,36 @@ func (g *Geocoder) CreateFTSTriggers(ctx context.Context) error {
 	return nil
 }
 
+// NeedsFTSRebuild returns true if the places table has data but the FTS index is empty.
+// This is a fast check using EXISTS instead of COUNT(*) to avoid scanning 54M rows.
+func (g *Geocoder) NeedsFTSRebuild(ctx context.Context) (bool, error) {
+	db := g.app.DB()
+	if db == nil {
+		return false, fmt.Errorf("db is not available")
+	}
+
+	// Fast check: does the places table have any rows?
+	var hasPlaces int
+	if err := db.NewQuery("SELECT EXISTS(SELECT 1 FROM geocoder_places LIMIT 1)").Row(&hasPlaces); err != nil {
+		return false, fmt.Errorf("failed to check places: %w", err)
+	}
+	if hasPlaces == 0 {
+		return false, nil // No places, no need to rebuild
+	}
+
+	// Fast check: does the FTS docsize table have any rows?
+	// We check geocoder_places_fts_docsize (the internal shadow table that
+	// stores per-document sizes) because
+	// SELECT COUNT(*) FROM geocoder_places_fts can be slow on 54M rows.
+	var hasFTS int
+	if err := db.NewQuery("SELECT EXISTS(SELECT 1 FROM geocoder_places_fts_docsize LIMIT 1)").Row(&hasFTS); err != nil {
+		// FTS docsize table might not exist; treat as needing rebuild.
+		return true, nil
+	}
+
+	return hasFTS == 0, nil
+}
+
 // RebuildFTS rebuilds the FTS5 index from the existing geocoder_places data.
 // This is useful after bulk imports that bypassed the FTS triggers.
 func (g *Geocoder) RebuildFTS(ctx context.Context) error {

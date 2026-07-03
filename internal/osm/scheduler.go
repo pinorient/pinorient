@@ -41,24 +41,34 @@ func (s *Scheduler) Start(ctx context.Context, app core.App) error {
 }
 
 // EnsureIndexed downloads and indexes OSM data if the places table is empty.
+// If places already exist but the FTS index is empty, it rebuilds the FTS index.
+// Uses fast EXISTS checks instead of COUNT(*) to avoid scanning 54M rows.
 func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
-	count, err := s.geo.Count(ctx)
+	needsRebuild, err := s.geo.NeedsFTSRebuild(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to check index count: %w", err)
+		return fmt.Errorf("failed to check FTS rebuild status: %w", err)
 	}
 
-	if count > 0 && !s.cfg.ForceReindex {
-		app.Logger().Info("geocoder index already populated", "count", count)
+	if needsRebuild {
+		// Places exist but FTS is empty — rebuild the FTS index.
+		app.Logger().Info("FTS index is empty; rebuilding in background...")
+		if err := s.geo.RebuildFTS(ctx); err != nil {
+			app.Logger().Error("FTS rebuild failed", "error", err)
+		} else {
+			app.Logger().Info("FTS index rebuild complete")
+		}
 		return nil
 	}
 
+	// FTS has data — check if we need a full re-import.
 	if s.cfg.ForceReindex {
-		app.Logger().Info("force reindex enabled; re-importing OSM data...", "current_count", count)
-	} else {
-		app.Logger().Info("geocoder index empty; fetching OSM data...")
+		app.Logger().Info("force reindex enabled; re-importing OSM data...")
+		return s.Refresh(ctx)
 	}
 
-	return s.Refresh(ctx)
+	// Everything is already populated.
+	app.Logger().Info("geocoder index already populated")
+	return nil
 }
 
 // Refresh downloads the latest OSM extract and re-indexes places.

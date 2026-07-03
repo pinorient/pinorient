@@ -13,17 +13,24 @@ func RunMigrations(app core.App) error {
 		return fmt.Errorf("db is not available")
 	}
 
-	// 1. Drop existing FTS tables and triggers so we can recreate with the correct schema.
-	//    The old migration used content_rowid='id' which is wrong because id is TEXT.
-	ftsCleanup := []string{
-		"DROP TRIGGER IF EXISTS places_fts_insert",
-		"DROP TRIGGER IF EXISTS places_fts_delete",
-		"DROP TRIGGER IF EXISTS places_fts_update",
-		"DROP TABLE IF EXISTS geocoder_places_fts",
-	}
-	for _, q := range ftsCleanup {
-		if _, err := db.NewQuery(q).Execute(); err != nil {
-			return fmt.Errorf("fts cleanup failed: %w", err)
+	// 1. Check if the FTS5 table already exists.
+	//    Only drop and recreate if it doesn't exist (first run or schema change).
+	//    Dropping on every startup would destroy the index and force a hours-long rebuild.
+	var ftsTableExists int
+	_ = db.NewQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='geocoder_places_fts'").Row(&ftsTableExists)
+
+	if ftsTableExists == 0 {
+		// FTS table doesn't exist — drop any stale triggers and create fresh.
+		ftsCleanup := []string{
+			"DROP TRIGGER IF EXISTS places_fts_insert",
+			"DROP TRIGGER IF EXISTS places_fts_delete",
+			"DROP TRIGGER IF EXISTS places_fts_update",
+			"DROP TABLE IF EXISTS geocoder_places_fts",
+		}
+		for _, q := range ftsCleanup {
+			if _, err := db.NewQuery(q).Execute(); err != nil {
+				return fmt.Errorf("fts cleanup failed: %w", err)
+			}
 		}
 	}
 
@@ -47,7 +54,7 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
-	// 3. Create the FTS5 virtual table and sync triggers.
+	// 3. Create the FTS5 virtual table and sync triggers (IF NOT EXISTS so safe to run always).
 	//    Use the default rowid (not content_rowid='id') since id is TEXT.
 	//    The triggers use new.rowid/old.rowid which are the implicit integer rowids.
 	ftsQueries := []string{
@@ -76,17 +83,9 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
-	// 4. Rebuild the FTS index if there is existing data (e.g. from a previous import).
-	var count int64
-	if err := db.NewQuery("SELECT COUNT(*) FROM geocoder_places").Row(&count); err != nil {
-		return fmt.Errorf("failed to count places: %w", err)
-	}
-	if count > 0 {
-		if _, err := db.NewQuery("INSERT INTO geocoder_places_fts(geocoder_places_fts) VALUES('rebuild')").Execute(); err != nil {
-			// Log warning but don't fail - the FTS will be populated by triggers on new inserts.
-			app.Logger().Warn("failed to rebuild FTS index", "error", err)
-		}
-	}
+	// 4. FTS index rebuild is handled asynchronously by the application
+	//    after the server starts (see main.go). This prevents a hours-long
+	//    rebuild from blocking server startup.
 
 	return nil
 }
