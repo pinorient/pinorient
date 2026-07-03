@@ -83,6 +83,20 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
+	// Set SQLite performance pragmas for the 16GB database.
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=-262144",
+		"PRAGMA mmap_size=4294967296",
+		"PRAGMA temp_store=MEMORY",
+	}
+	for _, p := range pragmas {
+		if _, err := db.NewQuery(p).Execute(); err != nil {
+			app.Logger().Warn("failed to set pragma", "pragma", p, "error", err)
+		}
+	}
+
 	// 4. FTS index rebuild is handled asynchronously by the application
 	//    after the server starts (see main.go). This prevents a hours-long
 	//    rebuild from blocking server startup.

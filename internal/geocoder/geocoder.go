@@ -73,7 +73,7 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
-		ORDER BY rank
+		ORDER BY bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)
 		LIMIT {:limit}
 	`, bboxClause)
 
@@ -128,7 +128,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
-		ORDER BY rank
+		ORDER BY p.name
 		LIMIT {:limit}
 	`, bboxClause)
 
@@ -144,23 +144,45 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 }
 
 // buildPrefixQuery converts a user query into an FTS5 prefix query.
-// e.g., "1600 penn" -> "1600* penn*"
+// Only the last token gets a prefix wildcard (for autocomplete), while earlier
+// tokens require exact matches. Tokens shorter than 3 characters are skipped
+// entirely to avoid matching millions of rows (e.g., "st*" matches 12M rows).
+// The last token only gets a wildcard if it is 3-5 chars (likely still being typed).
+// Tokens of 6+ chars are treated as complete words (exact match) to avoid
+// matching millions of rows for common words like "street*" (10M+ matches).
+// e.g., "12 Warren St" -> "warren"
+// e.g., "12 Warren Stre" -> "warren" AND "stre*"
+// e.g., "12 Warren Street" -> "warren" AND "street"
 func buildPrefixQuery(q string) string {
 	q = strings.TrimSpace(q)
 	if q == "" {
 		return ""
 	}
 
-	// Split on whitespace and add * suffix to each token.
 	tokens := strings.Fields(q)
+	if len(tokens) == 0 {
+		return ""
+	}
+
+	var parts []string
 	for i, token := range tokens {
-		// Don't add * if the token already ends with *.
-		if !strings.HasSuffix(token, "*") {
-			tokens[i] = token + "*"
+		isLast := i == len(tokens)-1
+		// Skip very short tokens entirely.
+		if len(token) < 3 {
+			continue
+		}
+		if isLast && len(token) <= 5 && !strings.HasSuffix(token, "*") {
+			// Last token, 3-5 chars: prefix match for autocomplete
+			parts = append(parts, token+"*")
+		} else if isLast && len(token) <= 5 && strings.HasSuffix(token, "*") {
+			parts = append(parts, token)
+		} else {
+			// Earlier tokens or long last token: exact match
+			parts = append(parts, "\""+token+"\"")
 		}
 	}
 
-	return strings.Join(tokens, " AND ")
+	return strings.Join(parts, " AND ")
 }
 
 // Reverse performs a reverse geocoding lookup for the given coordinates.
