@@ -15,6 +15,20 @@ import (
 	"github.com/sellography/geocoder-pb/internal/models"
 )
 
+// BBox represents a geographic bounding box for filtering search results.
+// Coordinates use (lng, lat) ordering to match the Photon API convention.
+type BBox struct {
+	MinLng float64
+	MinLat float64
+	MaxLng float64
+	MaxLat float64
+}
+
+// Valid returns true if the bounding box has been initialized with non-zero values.
+func (b *BBox) Valid() bool {
+	return b != nil && b.MinLng != 0 && b.MaxLng != 0
+}
+
 // Geocoder provides address-to-coordinate lookup backed by SQLite/FTS5.
 type Geocoder struct {
 	app core.App
@@ -27,7 +41,8 @@ func New(app core.App, cfg *config.Config) *Geocoder {
 }
 
 // Search performs a geocoding search for the given query.
-func (g *Geocoder) Search(ctx context.Context, q string, limit int) ([]models.Place, error) {
+// If bbox is provided and valid, results are filtered to the bounding box.
+func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) ([]models.Place, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -38,21 +53,34 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int) ([]models.Pl
 	}
 
 	// Use FTS5 to match the query across indexed fields.
-	query := `
+	// When a bbox is provided, add a coordinate filter.
+	bboxClause := ""
+	params := dbx.Params{"query": q, "limit": limit}
+	if bbox != nil && bbox.Valid() {
+		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
+			       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
+		params["min_lat"] = bbox.MinLat
+		params["max_lat"] = bbox.MaxLat
+		params["min_lng"] = bbox.MinLng
+		params["max_lng"] = bbox.MaxLng
+	}
+
+	query := fmt.Sprintf(`
 		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
 		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
 		       p.created, p.updated
 		FROM geocoder_places p
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
+		%s
 		ORDER BY rank
 		LIMIT {:limit}
-	`
+	`, bboxClause)
 
 	var places []models.Place
 	if err := db.
 		NewQuery(query).
-		Bind(dbx.Params{"query": q, "limit": limit}).
+		Bind(params).
 		All(&places); err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
 	}
@@ -63,7 +91,8 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int) ([]models.Pl
 // Autocomplete performs a prefix-based search for autocomplete suggestions.
 // It uses FTS5 prefix matching (e.g., "cal*" matches "Calico", "California").
 // The query is tokenized and each token gets a * suffix for prefix matching.
-func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int) ([]models.Place, error) {
+// If bbox is provided and valid, results are filtered to the bounding box.
+func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *BBox) ([]models.Place, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -79,21 +108,34 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int) ([]mod
 		return []models.Place{}, nil
 	}
 
-	query := `
+	// When a bbox is provided, add a coordinate filter.
+	bboxClause := ""
+	params := dbx.Params{"query": ftsQuery, "limit": limit}
+	if bbox != nil && bbox.Valid() {
+		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
+			       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
+		params["min_lat"] = bbox.MinLat
+		params["max_lat"] = bbox.MaxLat
+		params["min_lng"] = bbox.MinLng
+		params["max_lng"] = bbox.MaxLng
+	}
+
+	query := fmt.Sprintf(`
 		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
 		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
 		       p.created, p.updated
 		FROM geocoder_places p
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
+		%s
 		ORDER BY rank
 		LIMIT {:limit}
-	`
+	`, bboxClause)
 
 	var places []models.Place
 	if err := db.
 		NewQuery(query).
-		Bind(dbx.Params{"query": ftsQuery, "limit": limit}).
+		Bind(params).
 		All(&places); err != nil {
 		return nil, fmt.Errorf("autocomplete failed: %w", err)
 	}
@@ -410,117 +452,117 @@ func (g *Geocoder) AppLogger() *slog.Logger {
 
 // NodeCoord represents a node's OSM ID and coordinates for way centroid computation.
 type NodeCoord struct {
-OSMID int64
-Lat   float64
-Lon   float64
+	OSMID int64
+	Lat   float64
+	Lon   float64
 }
 
 // CreateNodeCoordTable creates a temporary table for storing node coordinates.
 func (g *Geocoder) CreateNodeCoordTable(ctx context.Context) error {
-db := g.app.NonconcurrentDB()
-if db == nil {
-return fmt.Errorf("db is not available")
-}
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
 
-_, err := db.NewQuery(`CREATE TABLE IF NOT EXISTS _osm_node_coords (
+	_, err := db.NewQuery(`CREATE TABLE IF NOT EXISTS _osm_node_coords (
 osm_id INTEGER PRIMARY KEY,
 lat REAL NOT NULL,
 lon REAL NOT NULL
 )`).Execute()
-if err != nil {
-return fmt.Errorf("failed to create node coord table: %w", err)
-}
+	if err != nil {
+		return fmt.Errorf("failed to create node coord table: %w", err)
+	}
 
-// Create index for faster lookups.
-_, _ = db.NewQuery("CREATE INDEX IF NOT EXISTS idx_node_coords_osm_id ON _osm_node_coords(osm_id)").Execute()
+	// Create index for faster lookups.
+	_, _ = db.NewQuery("CREATE INDEX IF NOT EXISTS idx_node_coords_osm_id ON _osm_node_coords(osm_id)").Execute()
 
-return nil
+	return nil
 }
 
 // DropNodeCoordTable drops the temporary node coordinates table.
 func (g *Geocoder) DropNodeCoordTable(ctx context.Context) error {
-db := g.app.NonconcurrentDB()
-if db == nil {
-return fmt.Errorf("db is not available")
-}
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
 
-_, err := db.NewQuery("DROP TABLE IF EXISTS _osm_node_coords").Execute()
-if err != nil {
-return fmt.Errorf("failed to drop node coord table: %w", err)
-}
+	_, err := db.NewQuery("DROP TABLE IF EXISTS _osm_node_coords").Execute()
+	if err != nil {
+		return fmt.Errorf("failed to drop node coord table: %w", err)
+	}
 
-return nil
+	return nil
 }
 
 // BatchInsertNodeCoords inserts node coordinates in batches.
 func (g *Geocoder) BatchInsertNodeCoords(ctx context.Context, coords []NodeCoord) error {
-db := g.app.NonconcurrentDB()
-if db == nil {
-return fmt.Errorf("db is not available")
-}
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
 
-txErr := g.app.RunInTransaction(func(txApp core.App) error {
-txDB := txApp.NonconcurrentDB()
-if txDB == nil {
-return fmt.Errorf("transaction db is not available")
-}
+	txErr := g.app.RunInTransaction(func(txApp core.App) error {
+		txDB := txApp.NonconcurrentDB()
+		if txDB == nil {
+			return fmt.Errorf("transaction db is not available")
+		}
 
-query := `INSERT OR REPLACE INTO _osm_node_coords (osm_id, lat, lon) VALUES ({:osm_id}, {:lat}, {:lon})`
+		query := `INSERT OR REPLACE INTO _osm_node_coords (osm_id, lat, lon) VALUES ({:osm_id}, {:lat}, {:lon})`
 
-for _, c := range coords {
-if _, err := txDB.NewQuery(query).Bind(dbx.Params{
-"osm_id": c.OSMID,
-"lat":    c.Lat,
-"lon":    c.Lon,
-}).Execute(); err != nil {
-return err
-}
-}
+		for _, c := range coords {
+			if _, err := txDB.NewQuery(query).Bind(dbx.Params{
+				"osm_id": c.OSMID,
+				"lat":    c.Lat,
+				"lon":    c.Lon,
+			}).Execute(); err != nil {
+				return err
+			}
+		}
 
-return nil
-})
+		return nil
+	})
 
-if txErr != nil {
-return fmt.Errorf("batch insert node coords failed: %w", txErr)
-}
+	if txErr != nil {
+		return fmt.Errorf("batch insert node coords failed: %w", txErr)
+	}
 
-return nil
+	return nil
 }
 
 // GetWayCentroid computes the centroid (average lat/lon) of a way from its node references.
 func (g *Geocoder) GetWayCentroid(ctx context.Context, nodeIDs []int64) (float64, float64, error) {
-if len(nodeIDs) == 0 {
-return 0, 0, fmt.Errorf("no node IDs provided")
-}
+	if len(nodeIDs) == 0 {
+		return 0, 0, fmt.Errorf("no node IDs provided")
+	}
 
-db := g.app.DB()
-if db == nil {
-return 0, 0, fmt.Errorf("db is not available")
-}
+	db := g.app.DB()
+	if db == nil {
+		return 0, 0, fmt.Errorf("db is not available")
+	}
 
-// Build a comma-separated list of node IDs for the IN clause.
-// Use parameterized query to avoid SQL injection.
-placeholders := make([]string, len(nodeIDs))
-params := make(dbx.Params, len(nodeIDs))
-for i, id := range nodeIDs {
-key := fmt.Sprintf("n%d", i)
-placeholders[i] = fmt.Sprintf("{:%s}", key)
-params[key] = id
-}
+	// Build a comma-separated list of node IDs for the IN clause.
+	// Use parameterized query to avoid SQL injection.
+	placeholders := make([]string, len(nodeIDs))
+	params := make(dbx.Params, len(nodeIDs))
+	for i, id := range nodeIDs {
+		key := fmt.Sprintf("n%d", i)
+		placeholders[i] = fmt.Sprintf("{:%s}", key)
+		params[key] = id
+	}
 
-query := fmt.Sprintf(
-"SELECT AVG(lat) as avg_lat, AVG(lon) as avg_lon FROM _osm_node_coords WHERE osm_id IN (%s)",
-strings.Join(placeholders, ", "),
-)
+	query := fmt.Sprintf(
+		"SELECT AVG(lat) as avg_lat, AVG(lon) as avg_lon FROM _osm_node_coords WHERE osm_id IN (%s)",
+		strings.Join(placeholders, ", "),
+	)
 
-var result struct {
-AvgLat float64 `db:"avg_lat"`
-AvgLon float64 `db:"avg_lon"`
-}
+	var result struct {
+		AvgLat float64 `db:"avg_lat"`
+		AvgLon float64 `db:"avg_lon"`
+	}
 
-if err := db.NewQuery(query).Bind(params).One(&result); err != nil {
-return 0, 0, fmt.Errorf("failed to get way centroid: %w", err)
-}
+	if err := db.NewQuery(query).Bind(params).One(&result); err != nil {
+		return 0, 0, fmt.Errorf("failed to get way centroid: %w", err)
+	}
 
-return result.AvgLat, result.AvgLon, nil
+	return result.AvgLat, result.AvgLon, nil
 }

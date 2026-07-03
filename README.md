@@ -13,6 +13,7 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 - OSM PBF parsing via `qedus/osmpbf`
 - Forward geocoding (`/api/geocoder/search?q=...`)
 - Reverse geocoding (`/api/geocoder/reverse?lat=...&lon=...`)
+- **Bounding box filtering** — limit search/autocomplete results to a geographic area (`bbox` parameter)
 - Domain-based access restriction with wildcard support (`*.mysite.com`)
 - Periodic OSM data refresh via cron expression
 - **Admin UI visibility** — geocoder data is stored in a PocketBase collection, viewable from the admin dashboard
@@ -108,11 +109,13 @@ Full-text search for places and addresses.
 |-----------|------|---------|-------------|
 | `q` | string | *(required)* | Search query (e.g., `1600 Pennsylvania Avenue NW, Washington, DC`) |
 | `limit` | int | `10` | Maximum number of results |
+| `bbox` | string | *(empty)* | Bounding box filter in `minLng,minLat,maxLng,maxLat` format (e.g., `-73.5,41.3,-72.8,41.6`). When provided, only results within the box are returned. |
 
 **Example:**
 
 ```bash
 curl "http://127.0.0.1:8090/api/geocoder/search?q=Calico&limit=5"
+curl "http://127.0.0.1:8090/api/geocoder/search?q=Calico&bbox=-73.5,41.3,-72.8,41.6"
 ```
 
 ```json
@@ -149,11 +152,13 @@ Prefix-based search optimized for type-ahead autocomplete. Each whitespace-separ
 |-----------|------|---------|-------------|
 | `q` | string | *(required)* | Partial query (e.g., `12 Englewood Ave`) |
 | `limit` | int | `10` | Maximum number of results |
+| `bbox` | string | *(empty)* | Bounding box filter in `minLng,minLat,maxLng,maxLat` format. When provided, only results within the box are returned. |
 
 **Example:**
 
 ```bash
 curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=12+Englewood+Ave&limit=5"
+curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=12+Englewood+Ave&bbox=-73.5,41.3,-72.8,41.6"
 ```
 
 ```json
@@ -252,7 +257,8 @@ Each result in the `results` array contains:
 | **OSM type** | Single letter: `N`, `W`, `R` | Full word: `node`, `way`, `relation` |
 | **Tag fields** | `osm_key`, `osm_value` | `class`, `type` |
 | **Address fields** | Separate `housenumber`, `street`, `city`, `state`, `postcode`, `country` | Combined `address` string + separate `city`, `state`, `postcode`, `country` |
-| **Location bias** | `lat`/`lon` params in search to bias results | Not supported |
+| **Location bias** | `lat`/`lon` params in search to bias results | Not supported (use `bbox` filter instead) |
+| **Bbox filtering** | `bbox=minLng,minLat,maxLng,maxLat` | `bbox=minLng,minLat,maxLng,maxLat` |
 | **Language** | `lang` param (e.g., `de`, `en`) | Not supported |
 | **Tag filtering** | `osm_tag=highway:residential` | Not supported |
 | **Backend** | Elasticsearch (Java, ~2GB RAM) | SQLite FTS5 (Go, <100MB RAM) |

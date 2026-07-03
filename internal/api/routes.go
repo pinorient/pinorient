@@ -29,7 +29,9 @@ func searchHandler(geo *geocoder.Geocoder) func(e *core.RequestEvent) error {
 		}
 
 		limit, _ := strconv.Atoi(c.Request.URL.Query().Get("limit"))
-		results, err := geo.Search(c.Request.Context(), q, limit)
+		bbox := parseBBox(c.Request.URL.Query().Get("bbox"))
+
+		results, err := geo.Search(c.Request.Context(), q, limit, bbox)
 		if err != nil {
 			return c.InternalServerError("search failed", err)
 		}
@@ -52,7 +54,9 @@ func autocompleteHandler(geo *geocoder.Geocoder) func(e *core.RequestEvent) erro
 		}
 
 		limit, _ := strconv.Atoi(c.Request.URL.Query().Get("limit"))
-		results, err := geo.Autocomplete(c.Request.Context(), q, limit)
+		bbox := parseBBox(c.Request.URL.Query().Get("bbox"))
+
+		results, err := geo.Autocomplete(c.Request.Context(), q, limit, bbox)
 		if err != nil {
 			return c.InternalServerError("autocomplete failed", err)
 		}
@@ -61,6 +65,44 @@ func autocompleteHandler(geo *geocoder.Geocoder) func(e *core.RequestEvent) erro
 			"query":   q,
 			"results": results,
 		})
+	}
+}
+
+// parseBBox parses a bounding box string in "minLng,minLat,maxLng,maxLat" format
+// (matching the Photon API convention). Returns nil if the string is empty or invalid.
+func parseBBox(s string) *geocoder.BBox {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+	if len(parts) != 4 {
+		return nil
+	}
+
+	minLng, err := strconv.ParseFloat(parts[0], 64)
+	if err != nil {
+		return nil
+	}
+	minLat, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil {
+		return nil
+	}
+	maxLng, err := strconv.ParseFloat(parts[2], 64)
+	if err != nil {
+		return nil
+	}
+	maxLat, err := strconv.ParseFloat(parts[3], 64)
+	if err != nil {
+		return nil
+	}
+
+	return &geocoder.BBox{
+		MinLng: minLng,
+		MinLat: minLat,
+		MaxLng: maxLng,
+		MaxLat: maxLat,
 	}
 }
 
