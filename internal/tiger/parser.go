@@ -1,18 +1,18 @@
 package tiger
 
 import (
-"context"
-"fmt"
-"log"
-"os"
-"path/filepath"
-"strconv"
-"strings"
-"time"
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
-"github.com/jonas-p/go-shp"
+	"github.com/jonas-p/go-shp"
 
-"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/sellography/geocoder-pb/internal/geocoder"
 )
 
 const batchBufferSize = 5000
@@ -53,11 +53,11 @@ func (p *Parser) ParseDir(ctx context.Context, dir string) error {
 
 		totalImported += count
 		log.Printf("  imported %d address ranges (total: %d, elapsed: %s)",
-count, totalImported, time.Since(startTime).Round(time.Second))
+			count, totalImported, time.Since(startTime).Round(time.Second))
 	}
 
 	log.Printf("tiger import complete: total=%d elapsed=%s",
-totalImported, time.Since(startTime).Round(time.Second))
+		totalImported, time.Since(startTime).Round(time.Second))
 	return nil
 }
 
@@ -140,7 +140,8 @@ func makeAddrRange(fullName, fromHN, toHN, parity, zip, side string, lat, lon fl
 		return nil
 	}
 	p := strings.TrimSpace(parity)
-	if p != "E" && p != "O" {
+	if p != "E" && p != "O" && p != "B" {
+		// Infer parity from the from house number when TIGER doesn't specify.
 		if from%2 == 0 {
 			p = "E"
 		} else {

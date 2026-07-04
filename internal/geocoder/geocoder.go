@@ -790,14 +790,17 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		var query string
 		var params dbx.Params
 
+		// TIGER/Line address ranges can go in either direction (from_hn may be
+		// greater than to_hn), so we use min()/max() to normalize the range.
+		// Parity "B" (both) matches any house number parity.
 		if i < 2 {
 			// Exact match for original and normalized names.
 			query = `
 				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
 				FROM tiger_addr_ranges t
 				WHERE t.full_name = {:street}
-				  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
-				  AND t.parity = {:parity}
+				  AND min(t.from_hn, t.to_hn) <= {:hn} AND max(t.from_hn, t.to_hn) >= {:hn}
+				  AND (t.parity = {:parity} OR t.parity = 'B')
 				LIMIT 1
 			`
 			params = dbx.Params{"street": candidate, "hn": houseNumber, "parity": parity}
@@ -807,8 +810,8 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
 				FROM tiger_addr_ranges t
 				WHERE t.full_name LIKE {:prefix} || '%'
-				  AND t.from_hn <= {:hn} AND t.to_hn >= {:hn}
-				  AND t.parity = {:parity}
+				  AND min(t.from_hn, t.to_hn) <= {:hn} AND max(t.from_hn, t.to_hn) >= {:hn}
+				  AND (t.parity = {:parity} OR t.parity = 'B')
 				LIMIT 1
 			`
 			params = dbx.Params{"prefix": candidate, "hn": houseNumber, "parity": parity}
@@ -822,10 +825,27 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		}
 
 		// Found a match — build the result.
+		// Use the user's street name (e.g., "Maple Street") for display,
+		// falling back to the TIGER full name if empty.
+		displayStreet := streetName
+		if displayStreet == "" {
+			displayStreet = ar.FullName
+		}
+
+		// Derive state from the configured county FIPS codes.
+		// The first 2 digits of a county FIPS code are the state FIPS.
+		state := fipsToState(g.cfg.TIGERCounties)
+
+		// Look up the city from OSM data using the ZIP code.
+		// TIGER ADDRFEAT only has ZIP codes, not city names.
+		city := g.lookupCityByZIP(ctx, ar.ZIP)
+
 		place := &models.Place{
 			ID:       fmt.Sprintf("tiger-%d-%s", houseNumber, ar.FullName),
-			Name:     fmt.Sprintf("%d %s", houseNumber, ar.FullName),
-			Address:  fmt.Sprintf("%d %s", houseNumber, ar.FullName),
+			Name:     fmt.Sprintf("%d %s", houseNumber, displayStreet),
+			Address:  fmt.Sprintf("%d %s", houseNumber, displayStreet),
+			City:     city,
+			State:    state,
 			Postcode: ar.ZIP,
 			Country:  "US",
 			Lat:      ar.Lat,
@@ -837,6 +857,61 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 	}
 
 	return nil, nil // No match found.
+}
+
+// fipsToState maps a county FIPS code's state portion (first 2 digits) to a
+// 2-letter state abbreviation. Returns "" if the state is unknown.
+func fipsToState(countyFIPS []string) string {
+	if len(countyFIPS) == 0 {
+		return ""
+	}
+	// State FIPS is the first 2 digits of the county FIPS code.
+	if len(countyFIPS[0]) < 2 {
+		return ""
+	}
+	stateFIPS := countyFIPS[0][:2]
+	stateMap := map[string]string{
+		"01": "AL", "02": "AK", "04": "AZ", "05": "AR", "06": "CA",
+		"08": "CO", "09": "CT", "10": "DE", "11": "DC", "12": "FL",
+		"13": "GA", "15": "HI", "16": "ID", "17": "IL", "18": "IN",
+		"19": "IA", "20": "KS", "21": "KY", "22": "LA", "23": "ME",
+		"24": "MD", "25": "MA", "26": "MI", "27": "MN", "28": "MS",
+		"29": "MO", "30": "MT", "31": "NE", "32": "NV", "33": "NH",
+		"34": "NJ", "35": "NM", "36": "NY", "37": "NC", "38": "ND",
+		"39": "OH", "40": "OK", "41": "OR", "42": "PA", "44": "RI",
+		"45": "SC", "46": "SD", "47": "TN", "48": "TX", "49": "UT",
+		"50": "VT", "51": "VA", "53": "WA", "54": "WV", "55": "WI",
+		"56": "WY",
+	}
+	return stateMap[stateFIPS]
+}
+
+// lookupCityByZIP finds the most common city name associated with a ZIP code
+// in the OSM geocoder_places data. Returns "" if no match is found.
+func (g *Geocoder) lookupCityByZIP(ctx context.Context, zip string) string {
+	if zip == "" {
+		return ""
+	}
+	db := g.app.DB()
+	if db == nil {
+		return ""
+	}
+	var city string
+	// Find the most frequent non-empty city for this postcode.
+	err := db.NewQuery(`
+		SELECT city FROM (
+			SELECT city, COUNT(*) AS cnt
+			FROM geocoder_places
+			WHERE postcode = {:zip} AND city != ''
+			GROUP BY city
+			ORDER BY cnt DESC
+			LIMIT 1
+		)
+	`).Bind(dbx.Params{"zip": zip}).Row(&city)
+	if err != nil {
+		return ""
+	}
+	return city
 }
 
 // BatchUpsertAddrRanges inserts or updates TIGER/Line address ranges in batches.
