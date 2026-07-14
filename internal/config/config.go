@@ -36,6 +36,7 @@ type Config struct {
 
 	// TIGERAllCounties enables importing TIGER/Line ADDRFEAT data for all US counties.
 	// This downloads ~3,200 county shapefiles (~50GB total) and may take several hours.
+	// Defaults to true. Set TIGER_ALL_COUNTIES=false/0 to disable and use TIGER_COUNTIES instead.
 	TIGERAllCounties bool
 
 	// TIGERForceReimport forces a full re-import of TIGER/Line data on startup,
@@ -46,14 +47,15 @@ type Config struct {
 // Load reads configuration from environment variables.
 func Load() *Config {
 	return &Config{
-		AllowedDomains:     splitAndTrim(os.Getenv("ALLOWED_DOMAINS")),
-		OSMDataURL:         getEnv("OSM_DATA_URL", "https://download.geofabrik.de/north-america/us-latest.osm.pbf"),
-		OSMDataPath:        getEnv("OSM_DATA_PATH", "./data"),
-		UpdateCron:         os.Getenv("UPDATE_CRON"),
-		ForceReindex:       getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
-		TIGERYear:          getEnv("TIGER_YEAR", "2024"),
-		TIGERCounties:      splitAndTrim(os.Getenv("TIGER_COUNTIES")),
-		TIGERAllCounties:   getEnv("TIGER_ALL_COUNTIES", "") != "" && getEnv("TIGER_ALL_COUNTIES", "") != "false" && getEnv("TIGER_ALL_COUNTIES", "") != "0",
+		AllowedDomains: splitAndTrim(os.Getenv("ALLOWED_DOMAINS")),
+		OSMDataURL:     getEnv("OSM_DATA_URL", "https://download.geofabrik.de/north-america/us-latest.osm.pbf"),
+		OSMDataPath:    getEnv("OSM_DATA_PATH", "./data"),
+		UpdateCron:     os.Getenv("UPDATE_CRON"),
+		ForceReindex:   getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
+		TIGERYear:      getEnv("TIGER_YEAR", "2024"),
+		TIGERCounties:  splitAndTrim(os.Getenv("TIGER_COUNTIES")),
+		// TIGER_ALL_COUNTIES defaults to true. Set to false/0 to disable.
+		TIGERAllCounties:   getEnv("TIGER_ALL_COUNTIES", "true") != "false" && getEnv("TIGER_ALL_COUNTIES", "true") != "0",
 		TIGERForceReimport: getEnv("TIGER_FORCE_REIMPORT", "") != "" && getEnv("TIGER_FORCE_REIMPORT", "") != "false" && getEnv("TIGER_FORCE_REIMPORT", "") != "0",
 	}
 }

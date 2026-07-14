@@ -49,6 +49,10 @@ Configuration is read from environment variables:
 | `OSM_DATA_PATH` | Local directory for OSM data | `./data` |
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
 | `FORCE_REINDEX` | Force full re-import on startup (`true`/`1` to enable) | *(empty = disabled)* |
+| `TIGER_YEAR` | Year of TIGER/Line data to download | `2024` |
+| `TIGER_ALL_COUNTIES` | Import TIGER/Line ADDRFEAT data for all US counties (~3,200 counties, ~50GB) | `true` |
+| `TIGER_COUNTIES` | Comma-separated county FIPS codes (only used when `TIGER_ALL_COUNTIES=false`) | *(empty)* |
+| `TIGER_FORCE_REIMPORT` | Force re-import of TIGER/Line data on startup | *(empty = disabled)* |
 
 ## Data Storage
 
@@ -302,6 +306,43 @@ If you're replacing a Photon deployment, you'll need to adapt your client code t
 - `features[].geometry.coordinates[0]` → `results[].lon`
 - `features[].properties.osm_type` `"N"`/`"W"`/`"R"` → `results[].osm_type` `"node"`/`"way"`/`"relation"`
 - `features[].properties.osm_key`/`osm_value` → `results[].class`/`type`
+
+## TIGER/Line Address Interpolation
+
+In addition to OSM data, `geocoder-pb` imports [TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) ADDRFEAT address range data from the US Census Bureau. This fills coverage gaps for addresses that exist in TIGER but not in OSM (e.g., house-numbered streets without address nodes in OSM).
+
+When a search or autocomplete query starts with a house number (e.g., `42 Maple Street`), the geocoder looks up matching TIGER address ranges and interpolates the coordinates. City and state names are enriched from OSM data using the ZIP code, since TIGER ADDRFEAT only contains ZIP codes.
+
+### Configuration
+
+By default, TIGER/Line data is imported for **all US counties** (~3,200 counties, ~50GB of data). This provides nationwide address coverage but may take several hours on first import.
+
+To limit the import to specific counties, set `TIGER_ALL_COUNTIES=false` and specify county FIPS codes:
+
+```bash
+# Import only Middlesex County, MA (Cambridge area)
+TIGER_ALL_COUNTIES=false TIGER_COUNTIES=25017 ./geocoder-pb serve
+```
+
+To force a re-import of TIGER data (e.g., after upgrading to a new year):
+
+```bash
+TIGER_FORCE_REIMPORT=1 ./geocoder-pb serve
+```
+
+### Verifying the Import
+
+Check the number of imported address ranges:
+
+```bash
+sqlite3 pb_data/data.db "SELECT COUNT(*) FROM tiger_addr_ranges;"
+```
+
+A complete US import should have ~30M+ rows. You can spot-check specific addresses:
+
+```bash
+sqlite3 pb_data/data.db "SELECT * FROM tiger_addr_ranges WHERE full_name = 'Birchwood Rd' AND zip = '88316';"
+```
 
 ## Data Refresh
 
