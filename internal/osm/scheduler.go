@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jonas-p/go-shp"
 	"github.com/pocketbase/pocketbase/core"
 
 	"github.com/sellography/geocoder-pb/internal/config"
@@ -77,7 +78,7 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 // EnsureTigerIndexed downloads and imports TIGER/Line address range data
 // for the configured counties if the tiger_addr_ranges table is empty.
 func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error {
-	if len(s.cfg.TIGERCounties) == 0 {
+	if !s.cfg.TIGERAllCounties && len(s.cfg.TIGERCounties) == 0 {
 		return nil
 	}
 
@@ -92,7 +93,11 @@ func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error 
 		return nil
 	}
 
-	app.Logger().Info("importing TIGER/Line address data", "counties", s.cfg.TIGERCounties)
+	if s.cfg.TIGERAllCounties {
+		app.Logger().Info("importing TIGER/Line address data for all US counties")
+	} else {
+		app.Logger().Info("importing TIGER/Line address data", "counties", s.cfg.TIGERCounties)
+	}
 	if err := s.ImportTiger(ctx, app); err != nil {
 		return fmt.Errorf("TIGER import failed: %w", err)
 	}
@@ -101,6 +106,8 @@ func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error 
 }
 
 // ImportTiger downloads and imports TIGER/Line ADDRFEAT shapefiles for all configured counties.
+// If TIGERAllCounties is enabled, it fetches the full list of US county FIPS codes
+// from the Census Bureau and imports all ~3,200 counties.
 func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
@@ -111,7 +118,21 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		return fmt.Errorf("failed to create tiger data directory: %w", err)
 	}
 
-	for _, fips := range s.cfg.TIGERCounties {
+	// Determine the list of county FIPS codes to import.
+	var counties []string
+	if s.cfg.TIGERAllCounties {
+		app.Logger().Info("fetching full list of US county FIPS codes from Census Bureau...")
+		allCounties, err := s.fetchAllCountyFIPS(ctx, app)
+		if err != nil {
+			return fmt.Errorf("failed to fetch county FIPS list: %w", err)
+		}
+		counties = allCounties
+		app.Logger().Info(fmt.Sprintf("found %d US counties to import", len(counties)))
+	} else {
+		counties = s.cfg.TIGERCounties
+	}
+
+	for _, fips := range counties {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -125,7 +146,8 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 				s.cfg.TIGERYear, s.cfg.TIGERYear, fips)
 			log.Printf("downloading TIGER/Line data from %s...", url)
 			if err := downloadFile(ctx, url, zipPath); err != nil {
-				return fmt.Errorf("failed to download TIGER data for county %s: %w", fips, err)
+				log.Printf("failed to download TIGER data for county %s: %v", fips, err)
+				continue // Skip failed counties instead of aborting the entire import.
 			}
 			log.Printf("TIGER/Line data downloaded for county %s", fips)
 		} else {
@@ -135,14 +157,16 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		// Extract the ZIP if the directory doesn't exist.
 		if _, err := os.Stat(extractDir); os.IsNotExist(err) {
 			if err := unzipFile(zipPath, extractDir); err != nil {
-				return fmt.Errorf("failed to unzip TIGER data for county %s: %w", fips, err)
+				log.Printf("failed to unzip TIGER data for county %s: %v", fips, err)
+				continue
 			}
 		}
 
 		// Parse and import the shapefile.
 		parser := tiger.NewParser(s.geo)
 		if err := parser.ParseDir(ctx, extractDir); err != nil {
-			return fmt.Errorf("failed to parse TIGER data for county %s: %w", fips, err)
+			log.Printf("failed to parse TIGER data for county %s: %v", fips, err)
+			continue
 		}
 	}
 
@@ -152,6 +176,63 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 	}
 
 	return nil
+}
+
+// fetchAllCountyFIPS fetches the complete list of US county FIPS codes from the
+// Census Bureau's TIGER/Line county shapefile. This is used when TIGERAllCounties
+// is enabled to import address data for every US county.
+func (s *Scheduler) fetchAllCountyFIPS(ctx context.Context, app core.App) ([]string, error) {
+	// Download the county shapefile ZIP from the Census Bureau.
+	zipPath := filepath.Join(s.cfg.OSMDataPath, "tiger", fmt.Sprintf("tl_%s_us_county.zip", s.cfg.TIGERYear))
+	if _, err := os.Stat(zipPath); os.IsNotExist(err) {
+		url := fmt.Sprintf("https://www2.census.gov/geo/tiger/TIGER%s/COUNTY/tl_%s_us_county.zip",
+			s.cfg.TIGERYear, s.cfg.TIGERYear)
+		log.Printf("downloading US county FIPS reference from %s...", url)
+		if err := downloadFile(ctx, url, zipPath); err != nil {
+			return nil, fmt.Errorf("failed to download county FIPS reference: %w", err)
+		}
+	}
+
+	// Extract the ZIP.
+	extractDir := filepath.Join(s.cfg.OSMDataPath, "tiger", "county_ref")
+	if _, err := os.Stat(extractDir); os.IsNotExist(err) {
+		if err := unzipFile(zipPath, extractDir); err != nil {
+			return nil, fmt.Errorf("failed to unzip county FIPS reference: %w", err)
+		}
+	}
+
+	// Parse the DBF file to extract FIPS codes.
+	// The county shapefile has COUNTYFP field at index 1 and STATEFP at index 0.
+	// The full FIPS code is STATEFP + COUNTYFP (5 digits total).
+	dbfPath := filepath.Join(extractDir, fmt.Sprintf("tl_%s_us_county.dbf", s.cfg.TIGERYear))
+	fipsCodes, err := parseCountyFIPSFromDBF(dbfPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse county FIPS codes: %w", err)
+	}
+
+	return fipsCodes, nil
+}
+
+// parseCountyFIPSFromDBF reads a TIGER county shapefile DBF and extracts all
+// 5-digit county FIPS codes (STATEFP + COUNTYFP).
+func parseCountyFIPSFromDBF(dbfPath string) ([]string, error) {
+	shape, err := shp.Open(dbfPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open county DBF: %w", err)
+	}
+	defer shape.Close()
+
+	var fipsCodes []string
+	for i := 0; shape.Next(); i++ {
+		// STATEFP (field 0) + COUNTYFP (field 1) = 5-digit FIPS code
+		stateFP := strings.TrimSpace(shape.ReadAttribute(i, 0))
+		countyFP := strings.TrimSpace(shape.ReadAttribute(i, 1))
+		if stateFP != "" && countyFP != "" {
+			fipsCodes = append(fipsCodes, stateFP+countyFP)
+		}
+	}
+
+	return fipsCodes, nil
 }
 
 // Refresh downloads the latest OSM extract and re-indexes places.

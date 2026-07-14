@@ -31,7 +31,12 @@ type Config struct {
 
 	// TIGERCounties is a list of FIPS codes for counties to download
 	// and import TIGER/Line ADDRFEAT data for (e.g., "25017" for Middlesex County, MA).
+	// If TIGERAllCounties is true, this is ignored and all US counties are imported.
 	TIGERCounties []string
+
+	// TIGERAllCounties enables importing TIGER/Line ADDRFEAT data for all US counties.
+	// This downloads ~3,200 county shapefiles (~50GB total) and may take several hours.
+	TIGERAllCounties bool
 
 	// TIGERForceReimport forces a full re-import of TIGER/Line data on startup,
 	// even if the tiger_addr_ranges table already has data.
@@ -48,6 +53,7 @@ func Load() *Config {
 		ForceReindex:       getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
 		TIGERYear:          getEnv("TIGER_YEAR", "2024"),
 		TIGERCounties:      splitAndTrim(os.Getenv("TIGER_COUNTIES")),
+		TIGERAllCounties:   getEnv("TIGER_ALL_COUNTIES", "") != "" && getEnv("TIGER_ALL_COUNTIES", "") != "false" && getEnv("TIGER_ALL_COUNTIES", "") != "0",
 		TIGERForceReimport: getEnv("TIGER_FORCE_REIMPORT", "") != "" && getEnv("TIGER_FORCE_REIMPORT", "") != "false" && getEnv("TIGER_FORCE_REIMPORT", "") != "0",
 	}
 }
