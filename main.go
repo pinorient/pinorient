@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strconv"
+
+	"os"
 
 	"github.com/joho/godotenv"
 	"github.com/pocketbase/dbx"
@@ -16,6 +20,24 @@ import (
 	"github.com/sellography/geocoder-pb/internal/osm"
 )
 
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
+func getEnvInt64(key string, fallback int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
 func main() {
 	// Load .env file if it exists. This allows configuration via a .env file
 	// instead of requiring environment variables to be set explicitly.
@@ -23,11 +45,15 @@ func main() {
 	_ = godotenv.Load()
 
 	// Use NewWithConfig to provide a custom DBConnect function with optimized pragmas
-	// for the 16GB geocoder database. The default PocketBase pragmas use a 32MB cache
-	// and no mmap, which is too small for 54M rows.
+	// for the geocoder database. Cache size and mmap size are configurable via
+	// environment variables to support servers with different amounts of RAM.
+	// Defaults: cache_size=64MB, mmap_size=0 (disabled) — safe for 2GB RAM servers.
+	// For machines with 8GB+ RAM, set DB_CACHE_SIZE=262144 and DB_MMAP_SIZE=4294967296.
+	cacheSize := getEnvInt("DB_CACHE_SIZE", 262144)     // in KB, 262144 = 256MB
+	mmapSize := getEnvInt64("DB_MMAP_SIZE", 4294967296) // in bytes, 4GB default
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DBConnect: func(dbPath string) (*dbx.DB, error) {
-			pragmas := "?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(200000000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-262144)&_pragma=mmap_size(4294967296)"
+			pragmas := fmt.Sprintf("?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(200000000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)", cacheSize, mmapSize)
 			return dbx.Open("sqlite", dbPath+pragmas)
 		},
 	})

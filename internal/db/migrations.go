@@ -3,6 +3,8 @@ package db
 import (
 	"fmt"
 
+	"os"
+
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -83,12 +85,21 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
-	// Set SQLite performance pragmas for the 16GB database.
+	// Set SQLite performance pragmas. Cache size and mmap size are configurable
+	// via environment variables to support servers with different amounts of RAM.
+	cacheSize := os.Getenv("DB_CACHE_SIZE")
+	if cacheSize == "" {
+		cacheSize = "65536" // 64MB (safe for 2GB servers)
+	}
+	mmapSize := os.Getenv("DB_MMAP_SIZE")
+	if mmapSize == "" {
+		mmapSize = "0" // disabled (safe for 2GB servers)
+	}
 	pragmas := []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-262144",
-		"PRAGMA mmap_size=4294967296",
+		"PRAGMA cache_size=-" + cacheSize,
+		"PRAGMA mmap_size=" + mmapSize,
 		"PRAGMA temp_store=MEMORY",
 	}
 	for _, p := range pragmas {
