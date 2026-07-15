@@ -26,7 +26,7 @@ type Config struct {
 	// Useful for recovering from interrupted imports or schema changes.
 	ForceReindex bool
 
-	// TIGERYear is the TIGER/Line year to download (e.g., "2024").
+	// TIGERYear is the TIGER/Line year to download (e.g., "2025").
 	TIGERYear string
 
 	// TIGERCounties is a list of FIPS codes for counties to download
@@ -52,7 +52,7 @@ func Load() *Config {
 		OSMDataPath:    getEnv("OSM_DATA_PATH", "./data"),
 		UpdateCron:     os.Getenv("UPDATE_CRON"),
 		ForceReindex:   getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
-		TIGERYear:      getEnv("TIGER_YEAR", "2024"),
+		TIGERYear:      getEnv("TIGER_YEAR", "2025"),
 		TIGERCounties:  splitAndTrim(os.Getenv("TIGER_COUNTIES")),
 		// TIGER_ALL_COUNTIES defaults to true. Set to false/0 to disable.
 		TIGERAllCounties:   getEnv("TIGER_ALL_COUNTIES", "true") != "false" && getEnv("TIGER_ALL_COUNTIES", "true") != "0",

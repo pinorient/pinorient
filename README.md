@@ -49,7 +49,7 @@ Configuration is read from environment variables:
 | `OSM_DATA_PATH` | Local directory for OSM data | `./data` |
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
 | `FORCE_REINDEX` | Force full re-import on startup (`true`/`1` to enable) | *(empty = disabled)* |
-| `TIGER_YEAR` | Year of TIGER/Line data to download | `2024` |
+| `TIGER_YEAR` | Year of TIGER/Line data to download | `2025` |
 | `TIGER_ALL_COUNTIES` | Import TIGER/Line ADDRFEAT data for all US counties (~3,200 counties, ~50GB) | `true` |
 | `TIGER_COUNTIES` | Comma-separated county FIPS codes (only used when `TIGER_ALL_COUNTIES=false`) | *(empty)* |
 | `TIGER_FORCE_REIMPORT` | Force re-import of TIGER/Line data on startup | *(empty = disabled)* |
