@@ -49,7 +49,7 @@ func Load() *Config {
 	return &Config{
 		AllowedDomains: splitAndTrim(os.Getenv("ALLOWED_DOMAINS")),
 		OSMDataURL:     getEnv("OSM_DATA_URL", "https://download.geofabrik.de/north-america/us-latest.osm.pbf"),
-		OSMDataPath:    getEnv("OSM_DATA_PATH", "./data"),
+		OSMDataPath:    getEnv("OSM_DATA_PATH", "./pb_data/geo_data"),
 		UpdateCron:     os.Getenv("UPDATE_CRON"),
 		ForceReindex:   getEnv("FORCE_REINDEX", "") != "" && getEnv("FORCE_REINDEX", "") != "false" && getEnv("FORCE_REINDEX", "") != "0",
 		TIGERYear:      getEnv("TIGER_YEAR", "2025"),

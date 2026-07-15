@@ -16,4 +16,4 @@ tidy:
 
 clean:
 	rm -f $(APP_NAME)
-	rm -rf pb_data data
+	rm -rf pb_data

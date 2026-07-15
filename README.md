@@ -40,13 +40,15 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 
 ## Configuration
 
-Configuration is read from environment variables:
+Configuration is read from environment variables. A `.env` file is **optional** — if present, it is loaded automatically (via `godotenv`), but all settings have sensible defaults and the app will start and auto-download data without any configuration file. This means you can deploy the binary to a server and simply run `./geocoder-pb serve` with no `.env` file or environment variables set.
+
+> **Note:** On a public-facing deployment, you may see 404 requests in the logs for paths like `/.env`, `/config.js`, `/api/config`, etc. These are automated scanners probing for exposed secrets. The server correctly returns 404 for all of them — no sensitive files are served.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `ALLOWED_DOMAINS` | Comma-separated allowed domains (supports `*.mysite.com`) | *(empty = public)* |
 | `OSM_DATA_URL` | URL to fetch OSM PBF data | `https://download.geofabrik.de/north-america/us-latest.osm.pbf` |
-| `OSM_DATA_PATH` | Local directory for OSM data | `./data` |
+| `OSM_DATA_PATH` | Local directory for OSM data (within PocketBase data dir) | `./pb_data/geo_data` |
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
 | `FORCE_REINDEX` | Force full re-import on startup (`true`/`1` to enable) | *(empty = disabled)* |
 | `TIGER_YEAR` | Year of TIGER/Line data to download | `2025` |

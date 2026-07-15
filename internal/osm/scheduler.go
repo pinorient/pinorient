@@ -48,6 +48,19 @@ func (s *Scheduler) Start(ctx context.Context, app core.App) error {
 // If places already exist but the FTS index is empty, it rebuilds the FTS index.
 // Uses fast EXISTS checks instead of COUNT(*) to avoid scanning 54M rows.
 func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
+	// Check if the places table has any data at all.
+	hasPlaces, err := s.geo.HasPlaces(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check places table: %w", err)
+	}
+
+	if !hasPlaces {
+		// Fresh deployment — download and import OSM data.
+		app.Logger().Info("places table is empty; downloading and indexing OSM data...")
+		return s.Refresh(ctx)
+	}
+
+	// Places exist — check if the FTS index needs rebuilding.
 	needsRebuild, err := s.geo.NeedsFTSRebuild(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to check FTS rebuild status: %w", err)

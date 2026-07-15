@@ -525,6 +525,21 @@ func (g *Geocoder) CreateFTSTriggers(ctx context.Context) error {
 	return nil
 }
 
+// HasPlaces returns true if the geocoder_places table has any rows.
+// Uses a fast EXISTS check instead of COUNT(*) to avoid scanning 54M rows.
+func (g *Geocoder) HasPlaces(ctx context.Context) (bool, error) {
+	db := g.app.DB()
+	if db == nil {
+		return false, fmt.Errorf("db is not available")
+	}
+
+	var hasRows int
+	if err := db.NewQuery("SELECT EXISTS(SELECT 1 FROM geocoder_places LIMIT 1)").Row(&hasRows); err != nil {
+		return false, fmt.Errorf("failed to check places: %w", err)
+	}
+	return hasRows == 1, nil
+}
+
 // NeedsFTSRebuild returns true if the places table has data but the FTS index is empty.
 // This is a fast check using EXISTS instead of COUNT(*) to avoid scanning 54M rows.
 func (g *Geocoder) NeedsFTSRebuild(ctx context.Context) (bool, error) {

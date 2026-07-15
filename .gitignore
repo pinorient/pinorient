@@ -24,7 +24,6 @@ pb_data/
 *.osm.pbf
 *.osm.bz2
 *.osm.gz
-data/
 
 # Environment variables
 .env
