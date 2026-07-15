@@ -62,6 +62,9 @@ Geocoder data is stored in PocketBase's main SQLite database (`pb_data/data.db`)
 
 - `geocoder_places` — a **PocketBase collection** containing the indexed place records. This collection is visible and manageable from the PocketBase admin UI at `/_/collections/geocoder_places`.
 - `geocoder_places_fts` — an FTS5 virtual table for full-text address search. This is a raw SQL table (not a collection) because FTS5 virtual tables are not directly supported as PocketBase collection types. It is kept in sync with `geocoder_places` via SQL triggers.
+- `tiger_addr_ranges` — TIGER/Line address range data for address interpolation (see below).
+- `tiger_addr_fts` — FTS5 index over `tiger_addr_ranges` for fast street name prefix matching.
+- `zip_city_state` — a cache table mapping ZIP codes to their most common city/state (derived from OSM data). Used to enrich TIGER results with city/state names via a JOIN, avoiding N+1 per-row lookups against the 54M-row `geocoder_places` table.
 
 The schema is created automatically on first startup by `internal/db/migrations.go`.
 

@@ -86,7 +86,7 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 
 	// Try TIGER address interpolation if the query starts with a house number.
 	if houseNum, streetName, ok := parseHouseNumber(q); ok {
-		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName); err == nil {
+		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, limit); err == nil {
 			for i := range tigerPlaces {
 				tp := &tigerPlaces[i]
 				// Apply bbox filter to TIGER result if needed.
@@ -121,7 +121,6 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
 		ORDER BY bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)
-		LIMIT {:limit}
 	`, bboxClause)
 
 	var osmPlaces []models.Place
@@ -180,8 +179,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
-		ORDER BY p.name
-		LIMIT {:limit}
+		ORDER BY rank
 	`, bboxClause)
 
 	var places []models.Place
@@ -196,7 +194,13 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 	// This fills coverage gaps for addresses that exist in TIGER but not OSM.
 	// Limit TIGER results so OSM results still appear in autocomplete.
 	if houseNum, streetName, ok := parseHouseNumber(q); ok {
-		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName); err == nil {
+		// Limit TIGER results to at most half the limit so OSM results
+		// still appear in autocomplete.
+		maxTiger := limit / 2
+		if maxTiger < 3 {
+			maxTiger = 3
+		}
+		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, maxTiger); err == nil {
 			var filtered []models.Place
 			for i := range tigerPlaces {
 				tp := &tigerPlaces[i]
@@ -206,15 +210,6 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 						tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
 					filtered = append(filtered, *tp)
 				}
-			}
-			// Limit TIGER results to at most half the limit so OSM results
-			// still appear in autocomplete.
-			maxTiger := limit / 2
-			if maxTiger < 3 {
-				maxTiger = 3
-			}
-			if len(filtered) > maxTiger {
-				filtered = filtered[:maxTiger]
 			}
 			places = append(filtered, places...)
 			if len(places) > limit {
@@ -286,7 +281,6 @@ func (g *Geocoder) Reverse(ctx context.Context, lat, lon float64, limit int) ([]
 		       ((lat - {:lat}) * (lat - {:lat}) + (lon - {:lon}) * (lon - {:lon})) AS dist
 		FROM geocoder_places
 		ORDER BY dist
-		LIMIT {:limit}
 	`
 
 	var places []models.Place
@@ -585,6 +579,54 @@ func (g *Geocoder) RebuildFTS(ctx context.Context) error {
 	return nil
 }
 
+// HasZipCache returns true if the zip_city_state cache table has any rows.
+func (g *Geocoder) HasZipCache(ctx context.Context) (bool, error) {
+	db := g.app.DB()
+	if db == nil {
+		return false, fmt.Errorf("db is not available")
+	}
+
+	var hasRows int
+	if err := db.NewQuery("SELECT EXISTS(SELECT 1 FROM zip_city_state LIMIT 1)").Row(&hasRows); err != nil {
+		return false, fmt.Errorf("failed to check zip cache: %w", err)
+	}
+	return hasRows == 1, nil
+}
+
+// RebuildZipCache rebuilds the zip_city_state cache table from geocoder_places.
+// This table maps ZIP codes to their most common city/state, enabling fast
+// JOINs in TIGER address interpolation instead of N+1 per-row lookups.
+func (g *Geocoder) RebuildZipCache(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	// Drop and recreate the cache table.
+	if _, err := db.NewQuery("DROP TABLE IF EXISTS zip_city_state").Execute(); err != nil {
+		return fmt.Errorf("failed to drop zip cache: %w", err)
+	}
+
+	if _, err := db.NewQuery(`
+		CREATE TABLE zip_city_state AS
+		SELECT postcode, city, state FROM (
+			SELECT postcode, city, state, COUNT(*) AS cnt,
+			       ROW_NUMBER() OVER (PARTITION BY postcode ORDER BY COUNT(*) DESC) as rn
+			FROM geocoder_places
+			WHERE city != '' AND postcode != ''
+			GROUP BY postcode, city, state
+		) WHERE rn = 1
+	`).Execute(); err != nil {
+		return fmt.Errorf("failed to build zip cache: %w", err)
+	}
+
+	if _, err := db.NewQuery("CREATE INDEX IF NOT EXISTS idx_zip_city_state ON zip_city_state(postcode)").Execute(); err != nil {
+		return fmt.Errorf("failed to create zip cache index: %w", err)
+	}
+
+	return nil
+}
+
 // LogProgress logs import progress at regular intervals.
 func (g *Geocoder) LogProgress(count int, startTime time.Time) {
 	elapsed := time.Since(startTime)
@@ -783,6 +825,19 @@ func normalizeStreetName(name string) string {
 	return strings.Join(words, " ")
 }
 
+// titleCase capitalizes the first letter of each word, leaving the rest lowercase.
+// This matches TIGER/Line's naming convention (e.g., "Birchwood Rd", "Main St")
+// so that case-sensitive index lookups work with lowercase user input.
+func titleCase(s string) string {
+	words := strings.Fields(s)
+	for i, w := range words {
+		if len(w) > 0 {
+			words[i] = strings.ToUpper(w[:1]) + strings.ToLower(w[1:])
+		}
+	}
+	return strings.Join(words, " ")
+}
+
 // tigerAddrRow represents a row from the tiger_addr_ranges table.
 type tigerAddrRow struct {
 	FullName string  `db:"full_name"`
@@ -793,6 +848,8 @@ type tigerAddrRow struct {
 	Side     string  `db:"side"`
 	Lat      float64 `db:"lat"`
 	Lon      float64 `db:"lon"`
+	City     string  `db:"city"`
+	State    string  `db:"state"`
 }
 
 // InterpolateAddress looks up a house number on a named street in TIGER data
@@ -804,7 +861,14 @@ type tigerAddrRow struct {
 // different cities/states (e.g., "11 Englewood Ave" exists in Brookline MA,
 // Bloomfield CT, and many other towns). All matches are returned so the caller
 // can present them as autocomplete options.
-func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string) ([]models.Place, error) {
+//
+// The limit parameter controls the maximum number of results returned, which
+// prevents fetching and enriching thousands of rows for common street names.
+func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string, limit int) ([]models.Place, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+
 	db := g.app.DB()
 	if db == nil {
 		return nil, fmt.Errorf("db is not available")
@@ -816,72 +880,18 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		parity = "E"
 	}
 
-	// Try exact match first, then fall back to normalized name, then LIKE prefix.
-	// This handles cases where the user types "Maple Street" but TIGER has "Maple St".
-	normalized := normalizeStreetName(streetName)
-	candidates := []string{streetName, normalized}
-	// Also try just the first word as a LIKE prefix (e.g., "Maple%" matches "Maple St").
-	if parts := strings.Fields(streetName); len(parts) > 0 {
-		candidates = append(candidates, parts[0])
-	}
+	// Derive state from the configured county FIPS codes.
+	// The first 2 digits of a county FIPS code are the state FIPS.
+	// When TIGER_ALL_COUNTIES is set, TIGERCounties is empty, so we fall
+	// back to the state from the zip_city_state cache (via the JOIN).
+	defaultState := fipsToState(g.cfg.TIGERCounties)
 
 	// Track which TIGER rows we've already emitted (dedup by full_name+zip+side).
-	// Different candidate strategies (exact, normalized, prefix) can produce
-	// overlapping results, so we dedup to avoid showing the same address twice.
 	seen := make(map[string]bool)
 	var results []models.Place
 
-	for i, candidate := range candidates {
-		var query string
-		var params dbx.Params
-
-		// TIGER/Line address ranges can go in either direction (from_hn may be
-		// greater than to_hn), so we use min()/max() to normalize the range.
-		// Parity "B" (both) matches any house number parity.
-		if i < 2 {
-			// Exact match for original and normalized names.
-			query = `
-				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
-				FROM tiger_addr_ranges t
-				WHERE t.full_name = {:street}
-				  AND min(t.from_hn, t.to_hn) <= {:hn} AND max(t.from_hn, t.to_hn) >= {:hn}
-				  AND (t.parity = {:parity} OR t.parity = 'B')
-			`
-			params = dbx.Params{"street": candidate, "hn": houseNumber, "parity": parity}
-		} else {
-			// LIKE prefix match as fallback (e.g., "Maple%" matches "Maple St").
-			query = `
-				SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon
-				FROM tiger_addr_ranges t
-				WHERE t.full_name LIKE {:prefix} || '%'
-				  AND min(t.from_hn, t.to_hn) <= {:hn} AND max(t.from_hn, t.to_hn) >= {:hn}
-				  AND (t.parity = {:parity} OR t.parity = 'B')
-			`
-			params = dbx.Params{"prefix": candidate, "hn": houseNumber, "parity": parity}
-		}
-
-		var rows []tigerAddrRow
-		if err := db.NewQuery(query).Bind(params).All(&rows); err != nil {
-			if err == sql.ErrNoRows {
-				continue // Try next candidate.
-			}
-			return nil, fmt.Errorf("tiger address lookup failed: %w", err)
-		}
-
-		// Build results from all matching rows.
-		// Use the user's street name (e.g., "Maple Street") for display,
-		// falling back to the TIGER full name if empty.
-		displayStreet := streetName
-		if displayStreet == "" && len(rows) > 0 {
-			displayStreet = rows[0].FullName
-		}
-
-		// Derive state from the configured county FIPS codes.
-		// The first 2 digits of a county FIPS code are the state FIPS.
-		// When TIGER_ALL_COUNTIES is set, TIGERCounties is empty, so we fall
-		// back to looking up the state from OSM data via the ZIP code.
-		state := fipsToState(g.cfg.TIGERCounties)
-
+	// Helper to build Place structs from tigerAddrRow results.
+	buildPlaces := func(rows []tigerAddrRow) {
 		for _, ar := range rows {
 			dedupKey := ar.FullName + "|" + ar.ZIP + "|" + ar.Side
 			if seen[dedupKey] {
@@ -889,19 +899,17 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 			}
 			seen[dedupKey] = true
 
-			// Look up the city and state from OSM data using the ZIP code.
-			// TIGER ADDRFEAT only has ZIP codes, not city/state names.
-			city, zipState := g.lookupCityStateByZIP(ctx, ar.ZIP)
-			if state == "" {
-				state = zipState
+			rowState := ar.State
+			if rowState == "" {
+				rowState = defaultState
 			}
 
 			place := models.Place{
 				ID:       fmt.Sprintf("tiger-%d-%s-%s-%s", houseNumber, ar.FullName, ar.ZIP, ar.Side),
-				Name:     fmt.Sprintf("%d %s", houseNumber, displayStreet),
-				Address:  fmt.Sprintf("%d %s", houseNumber, displayStreet),
-				City:     city,
-				State:    state,
+				Name:     fmt.Sprintf("%d %s", houseNumber, streetName),
+				Address:  fmt.Sprintf("%d %s", houseNumber, streetName),
+				City:     ar.City,
+				State:    rowState,
 				Postcode: ar.ZIP,
 				Country:  "US",
 				Lat:      ar.Lat,
@@ -911,6 +919,69 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 			}
 			results = append(results, place)
 		}
+	}
+
+	// 1. Try exact match on original and normalized street names.
+	// This handles cases where the user types "Maple Street" but TIGER has "Maple St".
+	// No LIMIT here — the full_name index makes this fast, and we need all matches so the
+	// caller can present different cities/states as autocomplete options.
+	// Title-case the street name to match TIGER's naming convention (e.g., "Birchwood Rd").
+	// This enables case-sensitive index lookups which are much faster than COLLATE NOCASE.
+	titleCased := titleCase(streetName)
+	normalized := titleCase(normalizeStreetName(streetName))
+	exactQuery := `
+		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
+		       z.city, z.state
+		FROM tiger_addr_ranges t
+		LEFT JOIN zip_city_state z ON z.postcode = t.zip
+		WHERE t.full_name IN ({:street1}, {:street2})
+		  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
+		  AND (t.parity = {:parity} OR t.parity = 'B')
+		ORDER BY t.rowid
+	`
+	var exactRows []tigerAddrRow
+	if err := db.NewQuery(exactQuery).Bind(dbx.Params{
+		"street1": titleCased,
+		"street2": normalized,
+		"hn":      houseNumber,
+		"parity":  parity,
+	}).All(&exactRows); err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("tiger address lookup failed: %w", err)
+	}
+	buildPlaces(exactRows)
+
+	// If we have enough results, return early.
+	if len(results) >= limit {
+		return results[:limit], nil
+	}
+
+	// 2. Fall back to FTS prefix match on the first word.
+	// This uses the tiger_addr_fts index instead of a LIKE full table scan.
+	// e.g., "main*" matches "Main St", "Main Rd", "Maine St", etc.
+	if parts := strings.Fields(streetName); len(parts) > 0 {
+		remaining := limit - len(results)
+		ftsQuery := parts[0] + "*"
+		ftsQuerySQL := `
+			SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
+			       z.city, z.state
+			FROM tiger_addr_ranges t
+			INNER JOIN tiger_addr_fts f ON t.rowid = f.rowid
+			LEFT JOIN zip_city_state z ON z.postcode = t.zip
+			WHERE tiger_addr_fts MATCH {:fts_query}
+			  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
+			  AND (t.parity = {:parity} OR t.parity = 'B')
+		LIMIT {:limit}
+		`
+		var ftsRows []tigerAddrRow
+		if err := db.NewQuery(ftsQuerySQL).Bind(dbx.Params{
+			"fts_query": ftsQuery,
+			"hn":        houseNumber,
+			"parity":    parity,
+			"limit":     remaining,
+		}).All(&ftsRows); err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("tiger address lookup failed: %w", err)
+		}
+		buildPlaces(ftsRows)
 	}
 
 	return results, nil
@@ -941,46 +1012,6 @@ func fipsToState(countyFIPS []string) string {
 		"56": "WY",
 	}
 	return stateMap[stateFIPS]
-}
-
-// lookupCityStateByZIP finds the most common city and state name associated
-// with a ZIP code in the OSM geocoder_places data. Returns empty strings if
-// no match is found. TIGER ADDRFEAT only has ZIP codes, not city/state names,
-// so we use OSM data to enrich TIGER results.
-func (g *Geocoder) lookupCityStateByZIP(ctx context.Context, zip string) (string, string) {
-	if zip == "" {
-		return "", ""
-	}
-	db := g.app.DB()
-	if db == nil {
-		return "", ""
-	}
-	// Find the most frequent non-empty city+state for this postcode.
-	var result struct {
-		City  string `db:"city"`
-		State string `db:"state"`
-	}
-	err := db.NewQuery(`
-		SELECT city, state FROM (
-			SELECT city, state, COUNT(*) AS cnt
-			FROM geocoder_places
-			WHERE postcode = {:zip} AND city != ''
-			GROUP BY city, state
-			ORDER BY cnt DESC
-			LIMIT 1
-		)
-	`).Bind(dbx.Params{"zip": zip}).One(&result)
-	if err != nil {
-		return "", ""
-	}
-	return result.City, result.State
-}
-
-// lookupCityByZIP finds the most common city name associated with a ZIP code
-// in the OSM geocoder_places data. Returns "" if no match is found.
-func (g *Geocoder) lookupCityByZIP(ctx context.Context, zip string) string {
-	city, _ := g.lookupCityStateByZIP(ctx, zip)
-	return city
 }
 
 // BatchUpsertAddrRanges inserts or updates TIGER/Line address ranges in batches.

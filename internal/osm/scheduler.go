@@ -74,8 +74,13 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 		} else {
 			app.Logger().Info("FTS index rebuild complete")
 		}
+		// Also rebuild the ZIP cache since places data is available.
+		s.ensureZipCache(ctx, app)
 		return nil
 	}
+
+	// FTS has data — ensure the ZIP cache exists for TIGER lookups.
+	s.ensureZipCache(ctx, app)
 
 	// FTS has data — check if we need a full re-import.
 	if s.cfg.ForceReindex {
@@ -86,6 +91,26 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 	// Everything is already populated.
 	app.Logger().Info("geocoder index already populated")
 	return nil
+}
+
+// ensureZipCache builds the zip_city_state cache table if it doesn't exist.
+// This table is needed for fast TIGER address interpolation lookups.
+func (s *Scheduler) ensureZipCache(ctx context.Context, app core.App) {
+	hasCache, err := s.geo.HasZipCache(ctx)
+	if err != nil {
+		app.Logger().Error("failed to check zip cache", "error", err)
+		return
+	}
+	if hasCache {
+		app.Logger().Info("zip city/state cache already populated")
+		return
+	}
+	app.Logger().Info("building zip city/state cache...")
+	if err := s.geo.RebuildZipCache(ctx); err != nil {
+		app.Logger().Error("zip cache rebuild failed", "error", err)
+	} else {
+		app.Logger().Info("zip city/state cache build complete")
+	}
 }
 
 // EnsureTigerIndexed downloads and imports TIGER/Line address range data
@@ -186,6 +211,11 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 	// Rebuild the TIGER FTS index after import.
 	if err := s.geo.RebuildTigerFTS(ctx); err != nil {
 		app.Logger().Warn("failed to rebuild TIGER FTS index", "error", err)
+	}
+
+	// Rebuild the ZIP cache since TIGER lookups depend on it.
+	if err := s.geo.RebuildZipCache(ctx); err != nil {
+		app.Logger().Warn("failed to rebuild zip cache", "error", err)
 	}
 
 	return nil

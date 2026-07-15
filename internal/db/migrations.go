@@ -129,6 +129,23 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
+	// 6. Create the zip_city_state cache table (empty; populated by scheduler).
+	//    This table maps ZIP codes to their most common city/state from OSM data,
+	//    enabling fast JOINs in TIGER address interpolation instead of N+1 lookups.
+	zipCacheQueries := []string{
+		`CREATE TABLE IF NOT EXISTS zip_city_state (
+			postcode TEXT NOT NULL,
+			city TEXT,
+			state TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_zip_city_state ON zip_city_state(postcode)`,
+	}
+	for _, q := range zipCacheQueries {
+		if _, err := db.NewQuery(q).Execute(); err != nil {
+			return fmt.Errorf("zip cache migration failed: %w", err)
+		}
+	}
+
 	return nil
 }
 
