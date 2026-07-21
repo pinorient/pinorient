@@ -131,6 +131,13 @@ func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error 
 		return nil
 	}
 
+	// If forcing a re-import, clear the progress markers so all counties are re-processed.
+	if s.cfg.TIGERForceReimport {
+		if err := s.geo.ClearTigerImportState(ctx); err != nil {
+			app.Logger().Warn("failed to clear TIGER import state", "error", err)
+		}
+	}
+
 	if s.cfg.TIGERAllCounties {
 		app.Logger().Info("importing TIGER/Line address data for all US counties")
 	} else {
@@ -170,10 +177,22 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		counties = s.cfg.TIGERCounties
 	}
 
-	for _, fips := range counties {
+	for idx, fips := range counties {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+
+		// Skip counties that have already been imported (crash recovery).
+		// This allows resuming an interrupted TIGER import without
+		// re-processing thousands of completed counties.
+		alreadyDone, err := s.geo.IsTigerCountyImported(ctx, fips)
+		if err != nil {
+			log.Printf("warning: failed to check import state for county %s: %v", fips, err)
+		} else if alreadyDone {
+			continue
+		}
+
+		log.Printf("TIGER county %d/%d: %s", idx+1, len(counties), fips)
 
 		zipPath := filepath.Join(tigerDir, fmt.Sprintf("tl_%s_%s_addrfeat.zip", s.cfg.TIGERYear, fips))
 		extractDir := filepath.Join(tigerDir, fips)
@@ -201,10 +220,15 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		}
 
 		// Parse and import the shapefile.
-		parser := tiger.NewParser(s.geo)
+		parser := tiger.NewParser(s.geo, s.cfg.ImportBatchSize)
 		if err := parser.ParseDir(ctx, extractDir); err != nil {
 			log.Printf("failed to parse TIGER data for county %s: %v", fips, err)
 			continue
+		}
+
+		// Mark this county as imported so we can skip it on resume.
+		if err := s.geo.MarkTigerCountyImported(ctx, fips); err != nil {
+			log.Printf("warning: failed to mark county %s as imported: %v", fips, err)
 		}
 	}
 
@@ -279,6 +303,16 @@ func parseCountyFIPSFromDBF(dbfPath string) ([]string, error) {
 }
 
 // Refresh downloads the latest OSM extract and re-indexes places.
+//
+// Data safety: This function does NOT clear the existing index before importing.
+// Instead, it uses upserts (ON CONFLICT DO UPDATE), so if the import crashes
+// mid-way, the database retains all previously-imported records plus any new
+// records that were processed before the crash. The FTS index is rebuilt only
+// after all records are successfully inserted, so a crash leaves the FTS in
+// whatever state it was in before — which is still functional for the old data.
+//
+// To force a clean re-import (removing stale records), set FORCE_REINDEX=true
+// and manually clear the index before starting.
 func (s *Scheduler) Refresh(ctx context.Context) error {
 	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
 		return fmt.Errorf("failed to create data directory: %w", err)
@@ -303,11 +337,11 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 	}
 	defer f.Close()
 
-	if err := s.geo.ClearIndex(ctx); err != nil {
-		return fmt.Errorf("failed to clear index: %w", err)
-	}
+	// Note: We intentionally do NOT call ClearIndex() here.
+	// Upserts are idempotent (ON CONFLICT DO UPDATE), so re-importing is safe.
+	// If the import crashes, existing data is preserved rather than lost.
 
-	parser := NewParser(s.geo)
+	parser := NewParser(s.geo, s.cfg.ImportBatchSize, s.cfg.OSMDecoderWorkers)
 	if err := parser.Parse(ctx, f); err != nil {
 		return fmt.Errorf("failed to parse osm data: %w", err)
 	}

@@ -1,34 +1,44 @@
 package osm
 
 import (
-"context"
-"fmt"
-"io"
-"log"
-"runtime"
-"strings"
-"time"
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"runtime"
+	"strings"
+	"time"
 
-"github.com/qedus/osmpbf"
+	"github.com/qedus/osmpbf"
 
-"github.com/sellography/geocoder-pb/internal/geocoder"
-"github.com/sellography/geocoder-pb/internal/models"
+	"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/sellography/geocoder-pb/internal/models"
 )
 
-// batchBufferSize is the number of places to buffer before flushing to the database.
-const batchBufferSize = 5000
+// defaultBatchSize is the fallback batch size if none is configured.
+const defaultBatchSize = 2000
 
 // progressInterval is how often (in records) to log import progress.
 const progressInterval = 50000
 
 // Parser reads OSM PBF data and indexes relevant places.
 type Parser struct {
-	geo *geocoder.Geocoder
+	geo        *geocoder.Geocoder
+	batchSize  int
+	numWorkers int
 }
 
-// NewParser creates a new OSM parser.
-func NewParser(geo *geocoder.Geocoder) *Parser {
-	return &Parser{geo: geo}
+// NewParser creates a new OSM parser with the given batch size and decoder worker count.
+// If batchSize is <= 0, defaults to 2000 (safe for 2GB RAM servers).
+// If numWorkers is <= 0, defaults to runtime.NumCPU().
+func NewParser(geo *geocoder.Geocoder, batchSize, numWorkers int) *Parser {
+	if batchSize <= 0 {
+		batchSize = defaultBatchSize
+	}
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
+	return &Parser{geo: geo, batchSize: batchSize, numWorkers: numWorkers}
 }
 
 // Parse reads OSM PBF data from r and indexes addressable places.
@@ -39,162 +49,162 @@ func NewParser(geo *geocoder.Geocoder) *Parser {
 // FTS triggers are temporarily dropped during import to avoid per-row FTS
 // overhead, and the FTS index is rebuilt once at the end.
 func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
-// Drop FTS triggers to speed up bulk inserts.
-if err := p.geo.DropFTSTriggers(ctx); err != nil {
-return fmt.Errorf("failed to drop FTS triggers: %w", err)
-}
-defer func() {
-if err := p.geo.CreateFTSTriggers(ctx); err != nil {
-log.Printf("warning: failed to recreate FTS triggers: %v", err)
-}
-}()
+	// Drop FTS triggers to speed up bulk inserts.
+	if err := p.geo.DropFTSTriggers(ctx); err != nil {
+		return fmt.Errorf("failed to drop FTS triggers: %w", err)
+	}
+	defer func() {
+		if err := p.geo.CreateFTSTriggers(ctx); err != nil {
+			log.Printf("warning: failed to recreate FTS triggers: %v", err)
+		}
+	}()
 
-decoder := osmpbf.NewDecoder(r)
-if err := decoder.Start(runtime.NumCPU()); err != nil {
-return fmt.Errorf("failed to start osm decoder: %w", err)
-}
+	decoder := osmpbf.NewDecoder(r)
+	if err := decoder.Start(p.numWorkers); err != nil {
+		return fmt.Errorf("failed to start osm decoder: %w", err)
+	}
 
-startTime := time.Now()
-totalIndexed := 0
-skipped := 0
-buffer := make([]*models.Place, 0, batchBufferSize)
+	startTime := time.Now()
+	totalIndexed := 0
+	skipped := 0
+	buffer := make([]*models.Place, 0, p.batchSize)
 
-flush := func() error {
-if len(buffer) == 0 {
-return nil
-}
-saved, err := p.geo.BatchUpsertPlaces(ctx, buffer, batchBufferSize)
-if err != nil {
-return err
-}
-totalIndexed += saved
-buffer = buffer[:0]
-return nil
-}
+	flush := func() error {
+		if len(buffer) == 0 {
+			return nil
+		}
+		saved, err := p.geo.BatchUpsertPlaces(ctx, buffer, p.batchSize)
+		if err != nil {
+			return err
+		}
+		totalIndexed += saved
+		buffer = buffer[:0]
+		return nil
+	}
 
-for {
-if ctx.Err() != nil {
-_ = flush()
-return ctx.Err()
-}
+	for {
+		if ctx.Err() != nil {
+			_ = flush()
+			return ctx.Err()
+		}
 
-v, err := decoder.Decode()
-if err == io.EOF {
-break
-}
-if err != nil {
-_ = flush()
-return fmt.Errorf("decode error: %w", err)
-}
+		v, err := decoder.Decode()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			_ = flush()
+			return fmt.Errorf("decode error: %w", err)
+		}
 
-var place *models.Place
-switch obj := v.(type) {
-case *osmpbf.Node:
-place = nodeToPlace(obj)
-case *osmpbf.Way:
-			
-place = wayToPlace(obj)
-default:
-continue
-}
+		var place *models.Place
+		switch obj := v.(type) {
+		case *osmpbf.Node:
+			place = nodeToPlace(obj)
+		case *osmpbf.Way:
 
-if place != nil {
-buffer = append(buffer, place)
-if len(buffer) >= batchBufferSize {
-if err := flush(); err != nil {
-return err
-}
-if totalIndexed%progressInterval < batchBufferSize {
-log.Printf("osm import progress: indexed=%d skipped=%d elapsed=%s",
-totalIndexed, skipped, time.Since(startTime).Round(time.Second))
-}
-}
-} else {
-skipped++
-}
-}
+			place = wayToPlace(obj)
+		default:
+			continue
+		}
 
-if err := flush(); err != nil {
-return err
-}
+		if place != nil {
+			buffer = append(buffer, place)
+			if len(buffer) >= p.batchSize {
+				if err := flush(); err != nil {
+					return err
+				}
+				if totalIndexed%progressInterval < p.batchSize {
+					log.Printf("osm import progress: indexed=%d skipped=%d elapsed=%s",
+						totalIndexed, skipped, time.Since(startTime).Round(time.Second))
+				}
+			}
+		} else {
+			skipped++
+		}
+	}
 
-// Rebuild the FTS index in one shot.
-elapsed := time.Since(startTime)
-log.Printf("osm import: all records inserted, rebuilding FTS index... (indexed=%d skipped=%d elapsed=%s)",
-totalIndexed, skipped, elapsed.Round(time.Second))
-if err := p.geo.RebuildFTS(ctx); err != nil {
-return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
-}
+	if err := flush(); err != nil {
+		return err
+	}
 
-log.Printf("osm import complete: indexed=%d skipped=%d elapsed=%s",
-totalIndexed, skipped, elapsed.Round(time.Second))
+	// Rebuild the FTS index in one shot.
+	elapsed := time.Since(startTime)
+	log.Printf("osm import: all records inserted, rebuilding FTS index... (indexed=%d skipped=%d elapsed=%s)",
+		totalIndexed, skipped, elapsed.Round(time.Second))
+	if err := p.geo.RebuildFTS(ctx); err != nil {
+		return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
+	}
 
-return nil
+	log.Printf("osm import complete: indexed=%d skipped=%d elapsed=%s",
+		totalIndexed, skipped, elapsed.Round(time.Second))
+
+	return nil
 }
 
 // hasAddressTags checks if the tags contain address information.
 func hasAddressTags(tags map[string]string) bool {
-for k := range tags {
-if strings.HasPrefix(k, "addr:") {
-return true
-}
-}
-return false
+	for k := range tags {
+		if strings.HasPrefix(k, "addr:") {
+			return true
+		}
+	}
+	return false
 }
 
 // buildAddress constructs a display address string from addr: tags.
 func buildAddress(tags map[string]string) string {
-var parts []string
+	var parts []string
 
-housenumber := firstTag(tags, "addr:housenumber")
-street := firstTag(tags, "addr:street")
-if housenumber != "" && street != "" {
-parts = append(parts, housenumber+" "+street)
-} else if street != "" {
-parts = append(parts, street)
-} else if housenumber != "" {
-parts = append(parts, housenumber)
-}
+	housenumber := firstTag(tags, "addr:housenumber")
+	street := firstTag(tags, "addr:street")
+	if housenumber != "" && street != "" {
+		parts = append(parts, housenumber+" "+street)
+	} else if street != "" {
+		parts = append(parts, street)
+	} else if housenumber != "" {
+		parts = append(parts, housenumber)
+	}
 
-return strings.Join(parts, ", ")
+	return strings.Join(parts, ", ")
 }
 
 // nodeToPlace converts an OSM node to a Place if it has a name or address tags.
 func nodeToPlace(n *osmpbf.Node) *models.Place {
-name := n.Tags["name"]
-hasAddr := hasAddressTags(n.Tags)
+	name := n.Tags["name"]
+	hasAddr := hasAddressTags(n.Tags)
 
-if name == "" && !hasAddr {
-return nil
-}
+	if name == "" && !hasAddr {
+		return nil
+	}
 
-if name == "" {
-housenumber := firstTag(n.Tags, "addr:housenumber")
-street := firstTag(n.Tags, "addr:street")
-if housenumber != "" && street != "" {
-name = housenumber + " " + street
-} else if street != "" {
-name = street
-} else {
-return nil
-}
-}
+	if name == "" {
+		housenumber := firstTag(n.Tags, "addr:housenumber")
+		street := firstTag(n.Tags, "addr:street")
+		if housenumber != "" && street != "" {
+			name = housenumber + " " + street
+		} else if street != "" {
+			name = street
+		} else {
+			return nil
+		}
+	}
 
-return &models.Place{
-ID:       fmt.Sprintf("node/%d", n.ID),
-OSMID:    n.ID,
-OSMType:  "node",
-Name:     name,
-Address:  buildAddress(n.Tags),
-City:     firstTag(n.Tags, "addr:city", "city"),
-State:    firstTag(n.Tags, "addr:state", "state"),
-Postcode: firstTag(n.Tags, "addr:postcode", "postcode"),
-Country:  firstTag(n.Tags, "addr:country", "country"),
-Lat:      n.Lat,
-Lon:      n.Lon,
-Class:    n.Tags["class"],
-Type:     n.Tags["type"],
-}
+	return &models.Place{
+		ID:       fmt.Sprintf("node/%d", n.ID),
+		OSMID:    n.ID,
+		OSMType:  "node",
+		Name:     name,
+		Address:  buildAddress(n.Tags),
+		City:     firstTag(n.Tags, "addr:city", "city"),
+		State:    firstTag(n.Tags, "addr:state", "state"),
+		Postcode: firstTag(n.Tags, "addr:postcode", "postcode"),
+		Country:  firstTag(n.Tags, "addr:country", "country"),
+		Lat:      n.Lat,
+		Lon:      n.Lon,
+		Class:    n.Tags["class"],
+		Type:     n.Tags["type"],
+	}
 }
 
 // wayToPlace converts an OSM way to a Place if it has a name or address tags.

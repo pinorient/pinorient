@@ -785,6 +785,73 @@ func (g *Geocoder) HasTigerAddrRanges(ctx context.Context) (bool, error) {
 	return hasRows == 1, nil
 }
 
+// GetImportState retrieves a value from the _import_state table.
+// Returns "" if the key doesn't exist (table may not exist yet on first run).
+func (g *Geocoder) GetImportState(ctx context.Context, key string) (string, error) {
+	db := g.app.DB()
+	if db == nil {
+		return "", fmt.Errorf("db is not available")
+	}
+
+	var value string
+	err := db.NewQuery("SELECT value FROM _import_state WHERE key = {:key}").
+		Bind(dbx.Params{"key": key}).Row(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// SetImportState sets a key-value pair in the _import_state table.
+func (g *Geocoder) SetImportState(ctx context.Context, key, value string) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	_, err := db.NewQuery(`INSERT INTO _import_state (key, value) VALUES ({:key}, {:value})
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value`).
+		Bind(dbx.Params{"key": key, "value": value}).Execute()
+	if err != nil {
+		return fmt.Errorf("failed to set import state %s: %w", key, err)
+	}
+	return nil
+}
+
+// IsTigerCountyImported returns true if the given county FIPS code has already
+// been imported. This enables resuming an interrupted TIGER import without
+// re-processing completed counties.
+func (g *Geocoder) IsTigerCountyImported(ctx context.Context, fips string) (bool, error) {
+	v, err := g.GetImportState(ctx, "tiger_county_"+fips)
+	if err != nil {
+		return false, err
+	}
+	return v == "done", nil
+}
+
+// MarkTigerCountyImported marks a county as imported in the _import_state table.
+func (g *Geocoder) MarkTigerCountyImported(ctx context.Context, fips string) error {
+	return g.SetImportState(ctx, "tiger_county_"+fips, "done")
+}
+
+// ClearTigerImportState removes all TIGER county progress markers.
+// Called when a full TIGER re-import is forced.
+func (g *Geocoder) ClearTigerImportState(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	_, err := db.NewQuery("DELETE FROM _import_state WHERE key LIKE 'tiger_county_%'").Execute()
+	if err != nil {
+		return fmt.Errorf("failed to clear tiger import state: %w", err)
+	}
+	return nil
+}
+
 // RebuildTigerFTS rebuilds the TIGER FTS5 index from the tiger_addr_ranges table.
 func (g *Geocoder) RebuildTigerFTS(ctx context.Context) error {
 	db := g.app.NonconcurrentDB()

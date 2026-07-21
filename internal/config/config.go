@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -42,6 +43,26 @@ type Config struct {
 	// TIGERForceReimport forces a full re-import of TIGER/Line data on startup,
 	// even if the tiger_addr_ranges table already has data.
 	TIGERForceReimport bool
+
+	// ImportBatchSize controls how many records are buffered before flushing to
+	// the database during OSM and TIGER imports. Smaller values reduce peak
+	// memory usage at the cost of more frequent DB writes.
+	// Defaults to 2000 (safe for 2GB RAM servers). Increase to 5000+ on
+	// machines with 8GB+ RAM for faster imports.
+	ImportBatchSize int
+
+	// OSMDecoderWorkers controls the number of goroutines used by the OSM PBF
+	// decoder. Each worker consumes additional memory. On low-memory servers
+	// (2GB RAM), set this to 1-2. Defaults to 2.
+	// Set to 0 to use runtime.NumCPU() (not recommended for low-memory servers).
+	OSMDecoderWorkers int
+
+	// SerializeImports runs OSM and TIGER imports sequentially instead of
+	// concurrently. This halves peak memory usage at the cost of longer
+	// total wall-clock time (though imports are I/O-bound, so the slowdown
+	// is minimal). Defaults to true for safety on low-memory servers.
+	// Set SERIALIZE_IMPORTS=false to run imports concurrently (8GB+ RAM recommended).
+	SerializeImports bool
 }
 
 // Load reads configuration from environment variables.
@@ -57,7 +78,20 @@ func Load() *Config {
 		// TIGER_ALL_COUNTIES defaults to true. Set to false/0 to disable.
 		TIGERAllCounties:   getEnv("TIGER_ALL_COUNTIES", "true") != "false" && getEnv("TIGER_ALL_COUNTIES", "true") != "0",
 		TIGERForceReimport: getEnv("TIGER_FORCE_REIMPORT", "") != "" && getEnv("TIGER_FORCE_REIMPORT", "") != "false" && getEnv("TIGER_FORCE_REIMPORT", "") != "0",
+		ImportBatchSize:    getEnvInt("IMPORT_BATCH_SIZE", 2000),
+		OSMDecoderWorkers:  getEnvInt("OSM_DECODER_WORKERS", 2),
+		// SERIALIZE_IMPORTS defaults to true for safety on low-memory servers.
+		SerializeImports: getEnv("SERIALIZE_IMPORTS", "true") != "false" && getEnv("SERIALIZE_IMPORTS", "true") != "0",
 	}
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
 }
 
 func getEnv(key, fallback string) string {

@@ -15,15 +15,19 @@ import (
 	"github.com/sellography/geocoder-pb/internal/geocoder"
 )
 
-const batchBufferSize = 5000
+const defaultBatchSize = 2000
 const progressInterval = 50000
 
 type Parser struct {
-	geo *geocoder.Geocoder
+	geo       *geocoder.Geocoder
+	batchSize int
 }
 
-func NewParser(geo *geocoder.Geocoder) *Parser {
-	return &Parser{geo: geo}
+func NewParser(geo *geocoder.Geocoder, batchSize int) *Parser {
+	if batchSize <= 0 {
+		batchSize = defaultBatchSize
+	}
+	return &Parser{geo: geo, batchSize: batchSize}
 }
 
 func (p *Parser) ParseDir(ctx context.Context, dir string) error {
@@ -69,13 +73,13 @@ func (p *Parser) parseFile(ctx context.Context, shpPath string) (int, error) {
 	defer shape.Close()
 
 	imported := 0
-	buffer := make([]*geocoder.AddrRange, 0, batchBufferSize)
+	buffer := make([]*geocoder.AddrRange, 0, p.batchSize)
 
 	flush := func() error {
 		if len(buffer) == 0 {
 			return nil
 		}
-		saved, err := p.geo.BatchUpsertAddrRanges(ctx, buffer, batchBufferSize)
+		saved, err := p.geo.BatchUpsertAddrRanges(ctx, buffer, p.batchSize)
 		if err != nil {
 			return err
 		}
@@ -114,11 +118,11 @@ func (p *Parser) parseFile(ctx context.Context, shpPath string) (int, error) {
 			buffer = append(buffer, ar)
 		}
 
-		if len(buffer) >= batchBufferSize {
+		if len(buffer) >= p.batchSize {
 			if err := flush(); err != nil {
 				return imported, err
 			}
-			if imported%progressInterval < batchBufferSize {
+			if imported%progressInterval < p.batchSize {
 				log.Printf("tiger import progress: imported=%d", imported)
 			}
 		}

@@ -49,8 +49,8 @@ func main() {
 	// environment variables to support servers with different amounts of RAM.
 	// Defaults: cache_size=64MB, mmap_size=0 (disabled) — safe for 2GB RAM servers.
 	// For machines with 8GB+ RAM, set DB_CACHE_SIZE=262144 and DB_MMAP_SIZE=4294967296.
-	cacheSize := getEnvInt("DB_CACHE_SIZE", 262144)     // in KB, 262144 = 256MB
-	mmapSize := getEnvInt64("DB_MMAP_SIZE", 4294967296) // in bytes, 4GB default
+	cacheSize := getEnvInt("DB_CACHE_SIZE", 65536) // in KB, 65536 = 64MB
+	mmapSize := getEnvInt64("DB_MMAP_SIZE", 0)     // in bytes, 0 = disabled
 	app := pocketbase.NewWithConfig(pocketbase.Config{
 		DBConnect: func(dbPath string) (*dbx.DB, error) {
 			pragmas := fmt.Sprintf("?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=journal_size_limit(200000000)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_pragma=temp_store(MEMORY)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)", cacheSize, mmapSize)
@@ -81,19 +81,34 @@ func main() {
 	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
 		api.RegisterRoutes(e, geo, cfg)
 
-		// Index OSM data in the background so the server starts immediately.
-		go func() {
-			if err := scheduler.EnsureIndexed(context.Background(), app); err != nil {
-				app.Logger().Error("osm indexing failed", "error", err)
-			}
-		}()
+		// Run imports either sequentially or concurrently based on config.
+		// On low-memory servers (2GB RAM), sequential mode halves peak memory
+		// usage by ensuring OSM and TIGER imports don't run simultaneously.
+		if cfg.SerializeImports {
+			go func() {
+				// OSM first, then TIGER.
+				if err := scheduler.EnsureIndexed(context.Background(), app); err != nil {
+					app.Logger().Error("osm indexing failed", "error", err)
+				}
+				if err := scheduler.EnsureTigerIndexed(context.Background(), app); err != nil {
+					app.Logger().Error("tiger indexing failed", "error", err)
+				}
+			}()
+		} else {
+			// Index OSM data in the background so the server starts immediately.
+			go func() {
+				if err := scheduler.EnsureIndexed(context.Background(), app); err != nil {
+					app.Logger().Error("osm indexing failed", "error", err)
+				}
+			}()
 
-		// Index TIGER/Line address data in the background for address interpolation.
-		go func() {
-			if err := scheduler.EnsureTigerIndexed(context.Background(), app); err != nil {
-				app.Logger().Error("tiger indexing failed", "error", err)
-			}
-		}()
+			// Index TIGER/Line address data in the background for address interpolation.
+			go func() {
+				if err := scheduler.EnsureTigerIndexed(context.Background(), app); err != nil {
+					app.Logger().Error("tiger indexing failed", "error", err)
+				}
+			}()
+		}
 
 		if cfg.UpdateCron != "" {
 			if err := scheduler.Start(context.Background(), app); err != nil {

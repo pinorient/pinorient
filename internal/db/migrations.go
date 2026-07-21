@@ -157,6 +157,18 @@ func RunMigrations(app core.App) error {
 		}
 	}
 
+	// 7. Create the _import_state table for tracking import progress.
+	//    This enables crash recovery: if an import is interrupted, the scheduler
+	//    can resume from where it left off instead of starting over.
+	//    Used primarily for TIGER county-by-county resume tracking.
+	_, err = db.NewQuery(`CREATE TABLE IF NOT EXISTS _import_state (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	)`).Execute()
+	if err != nil {
+		return fmt.Errorf("import state migration failed: %w", err)
+	}
+
 	return nil
 }
 
