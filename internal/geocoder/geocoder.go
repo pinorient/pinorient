@@ -177,15 +177,18 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 
 	// Try TIGER address interpolation if the query starts with a house number.
 	if houseNum, streetName, ok := parseHouseNumber(q); ok {
-		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, limit); err == nil {
-			for i := range tigerPlaces {
-				tp := &tigerPlaces[i]
-				// Apply bbox filter to TIGER result if needed.
-				if bbox == nil || !bbox.Valid() ||
-					(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
-						tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
-					places = append(places, *tp)
-				}
+		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, limit)
+		if err != nil {
+			// Interpolation is best-effort; log and continue with OSM results.
+			g.app.Logger().Warn("tiger interpolation failed", "error", err, "query", q)
+		}
+		for i := range tigerPlaces {
+			tp := &tigerPlaces[i]
+			// Apply bbox filter to TIGER result if needed.
+			if bbox == nil || !bbox.Valid() ||
+				(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
+					tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
+				places = append(places, *tp)
 			}
 		}
 	}
@@ -212,6 +215,7 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
 		ORDER BY bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)
+		LIMIT {:limit}
 	`, bboxClause)
 
 	var osmPlaces []models.Place
@@ -271,6 +275,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
 		ORDER BY rank
+		LIMIT {:limit}
 	`, bboxClause)
 
 	var places []models.Place
@@ -291,22 +296,25 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		if maxTiger < 3 {
 			maxTiger = 3
 		}
-		if tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, maxTiger); err == nil {
-			var filtered []models.Place
-			for i := range tigerPlaces {
-				tp := &tigerPlaces[i]
-				// Apply bbox filter to TIGER result if needed.
-				if bbox == nil || !bbox.Valid() ||
-					(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
-						tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
-					filtered = append(filtered, *tp)
-				}
-			}
-			places = append(filtered, places...)
-			if len(places) > limit {
-				places = places[:limit]
+		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, maxTiger)
+		if err != nil {
+			// Interpolation is best-effort; log and continue with OSM results.
+			g.app.Logger().Warn("tiger interpolation failed", "error", err, "query", q)
+		}
+		var filtered []models.Place
+		for i := range tigerPlaces {
+			tp := &tigerPlaces[i]
+			// Apply bbox filter to TIGER result if needed.
+			if bbox == nil || !bbox.Valid() ||
+				(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
+					tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
+				filtered = append(filtered, *tp)
 			}
 		}
+		places = append(filtered, places...)
+	}
+	if len(places) > limit {
+		places = places[:limit]
 	}
 
 	return places, nil
@@ -1198,8 +1206,8 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 
 			place := models.Place{
 				ID:       fmt.Sprintf("tiger-%d-%s-%s-%s", houseNumber, ar.FullName, ar.ZIP, ar.Side),
-				Name:     fmt.Sprintf("%d %s", houseNumber, streetName),
-				Address:  fmt.Sprintf("%d %s", houseNumber, streetName),
+				Name:     fmt.Sprintf("%d %s", houseNumber, ar.FullName),
+				Address:  fmt.Sprintf("%d %s", houseNumber, ar.FullName),
 				City:     ar.City,
 				State:    rowState,
 				Postcode: ar.ZIP,
@@ -1221,9 +1229,12 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 	// This enables case-sensitive index lookups which are much faster than COLLATE NOCASE.
 	titleCased := titleCase(streetName)
 	normalized := titleCase(normalizeStreetName(streetName))
+	// Note: COALESCE is required because zip_city_state doesn't cover every ZIP;
+	// without it, scanning NULL city/state into strings fails and the whole
+	// interpolation silently returns no results.
 	exactQuery := `
 		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
-		       z.city, z.state
+		       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
 		FROM tiger_addr_ranges t
 		LEFT JOIN zip_city_state z ON z.postcode = t.zip
 		WHERE t.full_name IN ({:street1}, {:street2})
@@ -1255,7 +1266,7 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		ftsQuery := parts[0] + "*"
 		ftsQuerySQL := `
 			SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
-			       z.city, z.state
+			       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
 			FROM tiger_addr_ranges t
 			INNER JOIN tiger_addr_fts f ON t.rowid = f.rowid
 			LEFT JOIN zip_city_state z ON z.postcode = t.zip
