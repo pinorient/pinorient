@@ -63,6 +63,25 @@ type Config struct {
 	// is minimal). Defaults to true for safety on low-memory servers.
 	// Set SERIALIZE_IMPORTS=false to run imports concurrently (8GB+ RAM recommended).
 	SerializeImports bool
+
+	// FTSRebuildChunkSize controls how many rows are indexed per committed
+	// transaction when (re)building FTS5 indexes. Chunked rebuilds keep WAL
+	// growth and peak memory bounded on low-RAM servers and can resume from
+	// the last committed chunk after a crash. Defaults to 250000.
+	FTSRebuildChunkSize int
+
+	// TIGERKeepData keeps downloaded TIGER/Line ZIPs and extracted shapefiles
+	// on disk after a county has been imported. Defaults to false (delete
+	// after import) because the full US dataset is ~100GB unpacked, which
+	// does not fit on small VPS disks. Import state is tracked in the
+	// database, so deleting the files does not cause re-imports.
+	TIGERKeepData bool
+
+	// OSMKeepData keeps the downloaded OSM PBF file after a successful
+	// import. Defaults to true so scheduled refreshes and forced re-indexes
+	// don't have to re-download the (multi-GB) extract. Set OSM_KEEP_DATA=false
+	// to delete the file after import on space-constrained servers.
+	OSMKeepData bool
 }
 
 // Load reads configuration from environment variables.
@@ -81,7 +100,13 @@ func Load() *Config {
 		ImportBatchSize:    getEnvInt("IMPORT_BATCH_SIZE", 2000),
 		OSMDecoderWorkers:  getEnvInt("OSM_DECODER_WORKERS", 2),
 		// SERIALIZE_IMPORTS defaults to true for safety on low-memory servers.
-		SerializeImports: getEnv("SERIALIZE_IMPORTS", "true") != "false" && getEnv("SERIALIZE_IMPORTS", "true") != "0",
+		SerializeImports:    getEnv("SERIALIZE_IMPORTS", "true") != "false" && getEnv("SERIALIZE_IMPORTS", "true") != "0",
+		FTSRebuildChunkSize: getEnvInt("FTS_REBUILD_CHUNK", 250000),
+		// TIGER_KEEP_DATA defaults to false: source files are deleted after
+		// each county is imported to keep disk usage bounded (~100GB otherwise).
+		TIGERKeepData: getEnv("TIGER_KEEP_DATA", "") == "true" || getEnv("TIGER_KEEP_DATA", "") == "1",
+		// OSM_KEEP_DATA defaults to true so re-indexes don't re-download the extract.
+		OSMKeepData: getEnv("OSM_KEEP_DATA", "true") != "false" && getEnv("OSM_KEEP_DATA", "true") != "0",
 	}
 }
 

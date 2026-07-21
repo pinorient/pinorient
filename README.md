@@ -52,9 +52,30 @@ Configuration is read from environment variables. A `.env` file is **optional** 
 | `UPDATE_CRON` | Cron expression for periodic refresh | *(empty = disabled)* |
 | `FORCE_REINDEX` | Force full re-import on startup (`true`/`1` to enable) | *(empty = disabled)* |
 | `TIGER_YEAR` | Year of TIGER/Line data to download | `2025` |
-| `TIGER_ALL_COUNTIES` | Import TIGER/Line ADDRFEAT data for all US counties (~3,200 counties, ~50GB) | `true` |
+| `TIGER_ALL_COUNTIES` | Import TIGER/Line ADDRFEAT data for all US counties (~3,200 counties) | `true` |
 | `TIGER_COUNTIES` | Comma-separated county FIPS codes (only used when `TIGER_ALL_COUNTIES=false`) | *(empty)* |
 | `TIGER_FORCE_REIMPORT` | Force re-import of TIGER/Line data on startup | *(empty = disabled)* |
+| `TIGER_KEEP_DATA` | Keep TIGER ZIPs/shapefiles after import (`false` deletes them per county) | `false` |
+| `OSM_KEEP_DATA` | Keep the downloaded OSM PBF after a successful import | `true` |
+| `IMPORT_BATCH_SIZE` | Records buffered per DB transaction during imports | `2000` |
+| `OSM_DECODER_WORKERS` | Goroutines for OSM PBF decoding (each uses extra memory) | `2` |
+| `SERIALIZE_IMPORTS` | Run OSM and TIGER imports sequentially (halves peak memory) | `true` |
+| `FTS_REBUILD_CHUNK` | Rows indexed per transaction during FTS index rebuilds | `250000` |
+| `DB_CACHE_SIZE` | SQLite page cache per database, in KB | `65536` (64MB) |
+| `DB_MMAP_SIZE` | SQLite mmap size in bytes (`0` = disabled) | `0` |
+| `GOMEMLIMIT` | Standard Go heap limit (e.g. `1800MiB`); overrides `GO_MEM_LIMIT_MB` | `1500MiB` |
+| `GO_MEM_LIMIT_MB` | Go heap cap in MiB, applied only when `GOMEMLIMIT` is unset | `1500` |
+
+### Running on a small VPS (2GB RAM)
+
+The defaults are tuned so a full US import completes on a 2GB server:
+
+- **Chunked, resumable index builds.** The FTS5 indexes are built in committed chunks of `FTS_REBUILD_CHUNK` rows instead of one giant transaction. WAL growth and tokenizer memory stay bounded, and if the process is killed, the rebuild resumes from the last committed chunk instead of starting over.
+- **Crash-safe imports.** Progress is tracked in the `_import_state` table. If the server dies mid-import, the next start automatically re-runs the row import (idempotent upserts — no duplicates) or resumes the FTS rebuild where it stopped. TIGER counties already imported are skipped individually.
+- **Bounded disk usage.** TIGER ZIPs and shapefiles are deleted as each county finishes (`TIGER_KEEP_DATA=false`), so the TIGER phase needs only one county's worth of scratch space instead of ~100GB. Set `OSM_KEEP_DATA=false` to also delete the OSM extract after import.
+- **Bounded memory.** A `GOMEMLIMIT`-style heap cap (default 1500MiB) makes the Go GC reclaim memory before the kernel OOM killer fires. The SQLite driver is pure Go, so its cache is covered too.
+- **Atomic, retried downloads.** Downloads land in a `.part` file and are renamed on success, with 3 attempts — a killed download is never mistaken for a cached file.
+- A `wal_checkpoint(TRUNCATE)` + `PRAGMA optimize` runs after each bulk phase to reclaim disk and refresh query statistics.
 
 ## Data Storage
 
@@ -74,17 +95,19 @@ On first startup, the app checks whether `geocoder_places` is empty. If it is, i
 
 ### Recovering from Interrupted Imports
 
-If an import was interrupted (e.g. the process was killed), the index will be partially populated. On restart, the app sees existing records and skips indexing. To force a full re-import:
+Recovery is automatic. The app records import progress in the `_import_state` table, so if the process is killed mid-import, the next startup detects the incomplete state and resumes: the row import is re-run with idempotent upserts (no duplicates), an interrupted FTS index rebuild continues from its last committed chunk, and TIGER counties that were already imported are skipped.
+
+To force a clean full re-import anyway (e.g. after a schema change):
 
 ```bash
 FORCE_REINDEX=true ./geocoder-pb serve
 ```
 
-This clears the existing index and re-imports all OSM data from the downloaded PBF file.
+This re-imports all OSM data from the downloaded PBF file (existing rows are updated in place via upserts).
 
 ### Import Performance
 
-The importer uses batched transactions (5,000 records per batch) for dramatically faster inserts compared to one-by-one inserts. Progress is logged every 50,000 records with count, elapsed time, and records/second throughput.
+The importer uses batched transactions with multi-row INSERT statements (2,000 records per batch by default, configurable via `IMPORT_BATCH_SIZE`) for dramatically faster inserts compared to one-by-one inserts. Progress is logged every 50,000 records with count, elapsed time, and records/second throughput.
 
 ## Admin Access
 
@@ -320,7 +343,7 @@ When a search or autocomplete query starts with a house number (e.g., `42 Maple 
 
 ### Configuration
 
-By default, TIGER/Line data is imported for **all US counties** (~3,200 counties, ~50GB of data). This provides nationwide address coverage but may take several hours on first import.
+By default, TIGER/Line data is imported for **all US counties** (~3,200 counties). This provides nationwide address coverage but may take several hours on first import. Source files are deleted as each county completes (unless `TIGER_KEEP_DATA=true`), so the import needs little scratch disk space.
 
 To limit the import to specific counties, set `TIGER_ALL_COUNTIES=false` and specify county FIPS codes:
 

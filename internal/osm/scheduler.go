@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/jonas-p/go-shp"
 	"github.com/pocketbase/pocketbase/core"
@@ -44,9 +47,17 @@ func (s *Scheduler) Start(ctx context.Context, app core.App) error {
 	return nil
 }
 
-// EnsureIndexed downloads and indexes OSM data if the places table is empty.
-// If places already exist but the FTS index is empty, it rebuilds the FTS index.
-// Uses fast EXISTS checks instead of COUNT(*) to avoid scanning 54M rows.
+// EnsureIndexed downloads and indexes OSM data if needed, resuming interrupted
+// work automatically:
+//
+//   - places table empty          -> full download + import
+//   - import crashed mid-parse    -> re-import (upserts are idempotent)
+//   - FTS rebuild crashed mid-way -> resume from the last committed chunk
+//   - legacy fully-populated DBs  -> completion markers are backfilled, no re-import
+//
+// Completion is tracked via markers in _import_state because the previous
+// heuristic ("places table has rows -> skip import") left servers with a
+// permanently partial index after a crash.
 func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 	// Check if the places table has any data at all.
 	hasPlaces, err := s.geo.HasPlaces(ctx)
@@ -55,34 +66,77 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 	}
 
 	if !hasPlaces {
-		// Fresh deployment — download and import OSM data.
+		// Fresh deployment - download and import OSM data.
 		app.Logger().Info("places table is empty; downloading and indexing OSM data...")
 		return s.Refresh(ctx)
 	}
 
-	// Places exist — check if the FTS index needs rebuilding.
-	needsRebuild, err := s.geo.NeedsFTSRebuild(ctx)
+	placesDone, err := s.geo.GetImportState(ctx, geocoder.StateOSMPlacesDone)
+	if err != nil {
+		return fmt.Errorf("failed to check OSM import state: %w", err)
+	}
+	ftsEmpty, err := s.geo.NeedsFTSRebuild(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to check FTS rebuild status: %w", err)
 	}
 
-	if needsRebuild {
-		// Places exist but FTS is empty — rebuild the FTS index.
-		app.Logger().Info("FTS index is empty; rebuilding in background...")
-		if err := s.geo.RebuildFTS(ctx); err != nil {
-			app.Logger().Error("FTS rebuild failed", "error", err)
-		} else {
-			app.Logger().Info("FTS index rebuild complete")
+	if placesDone != "done" {
+		if ftsEmpty {
+			// Rows exist but the import never finished (crash mid-parse):
+			// a fully populated FTS means the import must have completed,
+			// an empty one means it didn't. Re-import; upserts are idempotent.
+			app.Logger().Info("detected interrupted OSM import; resuming (existing rows are upserted, not duplicated)...")
+			return s.Refresh(ctx)
 		}
-		// Also rebuild the ZIP cache since places data is available.
-		s.ensureZipCache(ctx, app)
-		return nil
+		// Rows exist and the FTS index is populated, but there are no
+		// completion markers: this is a database created before import-state
+		// tracking existed. Backfill the markers instead of re-importing.
+		app.Logger().Info("existing index detected; marking import state as complete")
+		if err := s.geo.SetImportState(ctx, geocoder.StateOSMPlacesDone, "done"); err != nil {
+			app.Logger().Warn("failed to mark OSM import complete", "error", err)
+		}
+		if err := s.geo.SetImportState(ctx, geocoder.StateOSMFTSDone, "done"); err != nil {
+			app.Logger().Warn("failed to mark OSM FTS rebuild complete", "error", err)
+		}
 	}
 
-	// FTS has data — ensure the ZIP cache exists for TIGER lookups.
+	// Places import is complete. Now ensure the FTS index is fully built.
+	// RebuildFTS resumes from the last committed chunk if a previous rebuild
+	// was interrupted.
+	ftsDone, err := s.geo.GetImportState(ctx, geocoder.StateOSMFTSDone)
+	if err != nil {
+		return fmt.Errorf("failed to check OSM FTS state: %w", err)
+	}
+	ftsOffset, err := s.geo.GetImportState(ctx, geocoder.StateOSMFTSOffset)
+	if err != nil {
+		return fmt.Errorf("failed to check OSM FTS rebuild progress: %w", err)
+	}
+
+	switch {
+	case ftsOffset != "":
+		// A previous chunked rebuild was interrupted - resume it.
+		app.Logger().Info("resuming interrupted FTS index rebuild...")
+		if err := s.geo.RebuildFTS(ctx); err != nil {
+			return fmt.Errorf("FTS rebuild failed: %w", err)
+		}
+		s.geo.Checkpoint(ctx)
+	case ftsEmpty:
+		app.Logger().Info("FTS index is empty; rebuilding in background...")
+		if err := s.geo.RebuildFTS(ctx); err != nil {
+			return fmt.Errorf("FTS rebuild failed: %w", err)
+		}
+		s.geo.Checkpoint(ctx)
+	case ftsDone != "done":
+		// FTS has rows but no completion marker (legacy DB) - mark it done.
+		if err := s.geo.SetImportState(ctx, geocoder.StateOSMFTSDone, "done"); err != nil {
+			app.Logger().Warn("failed to mark OSM FTS rebuild complete", "error", err)
+		}
+	}
+
+	// Ensure the ZIP cache exists for TIGER lookups.
 	s.ensureZipCache(ctx, app)
 
-	// FTS has data — check if we need a full re-import.
+	// Check if a full re-import was requested.
 	if s.cfg.ForceReindex {
 		app.Logger().Info("force reindex enabled; re-importing OSM data...")
 		return s.Refresh(ctx)
@@ -177,6 +231,12 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		counties = s.cfg.TIGERCounties
 	}
 
+	// Reclaim disk from files left behind by earlier versions (which kept
+	// every downloaded ZIP and extracted shapefile forever).
+	if !s.cfg.TIGERKeepData {
+		s.cleanupTigerData(ctx, tigerDir)
+	}
+
 	for idx, fips := range counties {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -230,16 +290,40 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		if err := s.geo.MarkTigerCountyImported(ctx, fips); err != nil {
 			log.Printf("warning: failed to mark county %s as imported: %v", fips, err)
 		}
+
+		// Free the disk space: the full US TIGER dataset is ~100GB unpacked,
+		// which does not fit on small VPS disks. The county marker above means
+		// the files are not needed again.
+		if !s.cfg.TIGERKeepData {
+			if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("warning: failed to delete %s: %v", zipPath, err)
+			}
+			if err := os.RemoveAll(extractDir); err != nil {
+				log.Printf("warning: failed to delete %s: %v", extractDir, err)
+			}
+		}
 	}
 
-	// Rebuild the TIGER FTS index after import.
-	if err := s.geo.RebuildTigerFTS(ctx); err != nil {
-		app.Logger().Warn("failed to rebuild TIGER FTS index", "error", err)
+	// Rebuild the TIGER FTS index after import (chunked + resumable). Skip if
+	// it already completed and no resume is pending (e.g. on restart when all
+	// counties were already imported).
+	ftsDone, _ := s.geo.GetImportState(ctx, geocoder.StateTigerFTSDone)
+	ftsOffset, _ := s.geo.GetImportState(ctx, geocoder.StateTigerFTSOffset)
+	if ftsDone != "done" || ftsOffset != "" {
+		if err := s.geo.RebuildTigerFTS(ctx); err != nil {
+			app.Logger().Warn("failed to rebuild TIGER FTS index", "error", err)
+		}
 	}
 
-	// Rebuild the ZIP cache since TIGER lookups depend on it.
-	if err := s.geo.RebuildZipCache(ctx); err != nil {
-		app.Logger().Warn("failed to rebuild zip cache", "error", err)
+	// Flush the WAL back into the main DB file to reclaim disk space.
+	s.geo.Checkpoint(ctx)
+
+	// Rebuild the ZIP cache since TIGER lookups depend on it. Skip if there
+	// is no OSM data yet (the OSM side rebuilds it once places exist).
+	if hasPlaces, err := s.geo.HasPlaces(ctx); err == nil && hasPlaces {
+		if err := s.geo.RebuildZipCache(ctx); err != nil {
+			app.Logger().Warn("failed to rebuild zip cache", "error", err)
+		}
 	}
 
 	return nil
@@ -302,14 +386,15 @@ func parseCountyFIPSFromDBF(dbfPath string) ([]string, error) {
 	return fipsCodes, nil
 }
 
-// Refresh downloads the latest OSM extract and re-indexes places.
+// Refresh downloads the latest OSM extract and re-indexes places, then rebuilds
+// the FTS index as a chunked, resumable operation.
 //
 // Data safety: This function does NOT clear the existing index before importing.
 // Instead, it uses upserts (ON CONFLICT DO UPDATE), so if the import crashes
 // mid-way, the database retains all previously-imported records plus any new
-// records that were processed before the crash. The FTS index is rebuilt only
-// after all records are successfully inserted, so a crash leaves the FTS in
-// whatever state it was in before — which is still functional for the old data.
+// records that were processed before the crash. Completion markers are only
+// set after each phase finishes, so an interrupted refresh is automatically
+// re-run (rows) or resumed (FTS rebuild) on the next startup.
 //
 // To force a clean re-import (removing stale records), set FORCE_REINDEX=true
 // and manually clear the index before starting.
@@ -341,21 +426,149 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 	// Upserts are idempotent (ON CONFLICT DO UPDATE), so re-importing is safe.
 	// If the import crashes, existing data is preserved rather than lost.
 
+	// Clear the completion markers up front: if the process dies mid-import,
+	// the missing markers tell EnsureIndexed to re-run on the next start
+	// instead of mistaking a partial index for a complete one.
+	if err := s.geo.DeleteImportState(ctx, geocoder.StateOSMPlacesDone); err != nil {
+		log.Printf("warning: failed to clear OSM import state: %v", err)
+	}
+	if err := s.geo.DeleteImportState(ctx, geocoder.StateOSMFTSDone); err != nil {
+		log.Printf("warning: failed to clear OSM FTS state: %v", err)
+	}
+
 	parser := NewParser(s.geo, s.cfg.ImportBatchSize, s.cfg.OSMDecoderWorkers)
 	if err := parser.Parse(ctx, f); err != nil {
 		return fmt.Errorf("failed to parse osm data: %w", err)
+	}
+	f.Close() // Close early so the file can be deleted below if needed.
+
+	if err := s.geo.SetImportState(ctx, geocoder.StateOSMPlacesDone, "done"); err != nil {
+		log.Printf("warning: failed to mark OSM import complete: %v", err)
+	}
+
+	// Rebuild the FTS index in committed chunks (crash-resumable; a previous
+	// interrupted rebuild resumes from its last committed chunk).
+	if err := s.geo.RebuildFTS(ctx); err != nil {
+		return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
+	}
+
+	// Flush the WAL back into the main DB file to reclaim disk space.
+	s.geo.Checkpoint(ctx)
+
+	if !s.cfg.OSMKeepData {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			log.Printf("warning: failed to delete OSM extract %s: %v", path, err)
+		} else {
+			log.Printf("deleted OSM extract %s (OSM_KEEP_DATA=false)", path)
+		}
 	}
 
 	return nil
 }
 
+// tigerCountyZipPattern matches downloaded county archives, e.g. tl_2025_25017_addrfeat.zip.
+var tigerCountyZipPattern = regexp.MustCompile(`^tl_\d{4}_(\d{5})_addrfeat\.zip$`)
+
+// cleanupTigerData deletes TIGER ZIPs and extracted directories for counties
+// that are already marked as imported. Older versions kept these files
+// forever (~100GB for the full US dataset), which exhausts small VPS disks.
+func (s *Scheduler) cleanupTigerData(ctx context.Context, tigerDir string) {
+	entries, err := os.ReadDir(tigerDir)
+	if err != nil {
+		return
+	}
+
+	removed := 0
+	for _, entry := range entries {
+		fips := ""
+		if m := tigerCountyZipPattern.FindStringSubmatch(entry.Name()); m != nil {
+			fips = m[1]
+		} else if entry.IsDir() && len(entry.Name()) == 5 && isDigits(entry.Name()) {
+			fips = entry.Name()
+		} else {
+			continue
+		}
+
+		done, err := s.geo.IsTigerCountyImported(ctx, fips)
+		if err != nil || !done {
+			continue
+		}
+
+		path := filepath.Join(tigerDir, entry.Name())
+		var rmErr error
+		if entry.IsDir() {
+			rmErr = os.RemoveAll(path)
+		} else {
+			rmErr = os.Remove(path)
+		}
+		if rmErr != nil {
+			log.Printf("warning: failed to remove stale TIGER data %s: %v", path, rmErr)
+		} else {
+			removed++
+		}
+	}
+
+	if removed > 0 {
+		log.Printf("removed %d stale TIGER data files/directories for already-imported counties", removed)
+	}
+}
+
+func isDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return len(s) > 0
+}
+
+// downloadHTTPClient is used for large dataset downloads. It has connection
+// and header timeouts (so a stalled server fails fast) but no overall timeout,
+// which would abort legitimate multi-GB downloads on slow links.
+var downloadHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 2 * time.Minute,
+		MaxIdleConns:          4,
+		IdleConnTimeout:       30 * time.Second,
+	},
+}
+
+// downloadFile fetches url to path with retries. The file is written to a
+// temporary ".part" file and atomically renamed on success, so an interrupted
+// download is never mistaken for a complete cached file on the next run.
 func downloadFile(ctx context.Context, url, path string) error {
+	const maxAttempts = 3
+
+	var err error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err = downloadFileOnce(ctx, url, path); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("download attempt %d/%d failed for %s: %v", attempt, maxAttempts, url, err)
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(attempt*attempt) * 5 * time.Second):
+			}
+		}
+	}
+	return fmt.Errorf("download failed after %d attempts: %w", maxAttempts, err)
+}
+
+func downloadFileOnce(ctx context.Context, url, path string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := downloadHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -365,14 +578,23 @@ func downloadFile(ctx context.Context, url, path string) error {
 		return fmt.Errorf("unexpected status: %s", resp.Status)
 	}
 
-	out, err := os.Create(path)
+	tmpPath := path + ".part"
+	out, err := os.Create(tmpPath)
 	if err != nil {
 		return err
 	}
-	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	_, copyErr := io.Copy(out, resp.Body)
+	closeErr := out.Close()
+	if copyErr != nil || closeErr != nil {
+		os.Remove(tmpPath)
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}
+
+	return os.Rename(tmpPath, path)
 }
 
 // unzipFile extracts a ZIP archive to the target directory.

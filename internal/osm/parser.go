@@ -47,7 +47,8 @@ func NewParser(geo *geocoder.Geocoder, batchSize, numWorkers int) *Parser {
 // the FTS search finds them by text, and coordinates can be resolved later.
 //
 // FTS triggers are temporarily dropped during import to avoid per-row FTS
-// overhead, and the FTS index is rebuilt once at the end.
+// overhead. The caller is responsible for rebuilding the FTS index afterwards
+// (the scheduler runs a chunked, crash-resumable rebuild via RebuildFTS).
 func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 	// Drop FTS triggers to speed up bulk inserts.
 	if err := p.geo.DropFTSTriggers(ctx); err != nil {
@@ -128,15 +129,8 @@ func (p *Parser) Parse(ctx context.Context, r io.Reader) error {
 		return err
 	}
 
-	// Rebuild the FTS index in one shot.
 	elapsed := time.Since(startTime)
-	log.Printf("osm import: all records inserted, rebuilding FTS index... (indexed=%d skipped=%d elapsed=%s)",
-		totalIndexed, skipped, elapsed.Round(time.Second))
-	if err := p.geo.RebuildFTS(ctx); err != nil {
-		return fmt.Errorf("failed to rebuild FTS index after import: %w", err)
-	}
-
-	log.Printf("osm import complete: indexed=%d skipped=%d elapsed=%s",
+	log.Printf("osm row import complete: indexed=%d skipped=%d elapsed=%s (FTS rebuild is handled by the scheduler)",
 		totalIndexed, skipped, elapsed.Round(time.Second))
 
 	return nil

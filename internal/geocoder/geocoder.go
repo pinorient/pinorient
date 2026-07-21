@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -39,6 +40,96 @@ type Geocoder struct {
 // New creates a new Geocoder instance.
 func New(app core.App, cfg *config.Config) *Geocoder {
 	return &Geocoder{app: app, cfg: cfg}
+}
+
+// Import-state keys used in the _import_state table to make long-running
+// imports crash-resumable. A missing "*_done" marker means the corresponding
+// step never completed and must be re-run (or resumed) on startup.
+const (
+	// StateOSMPlacesDone is set when a full OSM row import completes.
+	StateOSMPlacesDone = "osm_places_done"
+	// StateOSMFTSDone is set when the places FTS5 index is fully rebuilt.
+	StateOSMFTSDone = "osm_fts_done"
+	// StateOSMFTSOffset holds the last committed rowid during a chunked
+	// places FTS rebuild (deleted on completion).
+	StateOSMFTSOffset = "osm_fts_offset"
+	// StateTigerFTSDone is set when the TIGER FTS5 index is fully rebuilt.
+	StateTigerFTSDone = "tiger_fts_done"
+	// StateTigerFTSOffset holds the last committed rowid during a chunked
+	// TIGER FTS rebuild (deleted on completion).
+	StateTigerFTSOffset = "tiger_fts_offset"
+)
+
+// maxInsertVars caps the number of bound variables per INSERT statement.
+// SQLite's historical SQLITE_MAX_VARIABLE_NUMBER is 999 (32766 in modern
+// builds); staying below it keeps the generated SQL portable.
+const maxInsertVars = 900
+
+// defaultFTSRebuildChunkSize is the fallback chunk size for chunked FTS
+// rebuilds when none is configured.
+const defaultFTSRebuildChunkSize = 250000
+
+// execMultiValueInsert executes an INSERT with multiple VALUES rows per
+// statement, chunking the rows so no statement binds more than maxInsertVars
+// variables. Bulk imports previously parsed one INSERT per row (tens of
+// millions of parses for the full US dataset); this is dramatically faster.
+//
+//	head:      "INSERT INTO tbl (c1, c2) VALUES " — column count must equal len(row) (+ literals in rowSuffix).
+//	rowSuffix: literal SQL appended inside each row's parentheses after the
+//	           bound values, e.g. ", datetime('now')" (may be empty).
+//	tail:      SQL appended after the VALUES list (e.g. an ON CONFLICT clause).
+//	rows:      one slice of bound values per row, all the same length.
+func execMultiValueInsert(txDB dbx.Builder, head, rowSuffix, tail string, rows [][]any) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	cols := len(rows[0])
+	if cols == 0 {
+		return fmt.Errorf("insert rows must have at least one column")
+	}
+	perStmt := maxInsertVars / cols
+	if perStmt < 1 {
+		perStmt = 1
+	}
+
+	for start := 0; start < len(rows); start += perStmt {
+		end := start + perStmt
+		if end > len(rows) {
+			end = len(rows)
+		}
+		sql, params := buildMultiValueInsert(head, rowSuffix, tail, rows[start:end])
+		if _, err := txDB.NewQuery(sql).Bind(params).Execute(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// buildMultiValueInsert builds a single multi-row INSERT statement with named
+// bind parameters (see execMultiValueInsert). Extracted as a pure function
+// for testability.
+func buildMultiValueInsert(head, rowSuffix, tail string, rows [][]any) (string, dbx.Params) {
+	var sb strings.Builder
+	sb.WriteString(head)
+	params := make(dbx.Params, len(rows)*len(rows[0]))
+	for r, row := range rows {
+		if r > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteByte('(')
+		for c, val := range row {
+			if c > 0 {
+				sb.WriteByte(',')
+			}
+			key := fmt.Sprintf("v%d_%d", r, c)
+			sb.WriteString("{:" + key + "}")
+			params[key] = val
+		}
+		sb.WriteString(rowSuffix)
+		sb.WriteByte(')')
+	}
+	sb.WriteString(tail)
+	return sb.String(), params
 }
 
 // parseHouseNumber attempts to extract a leading house number from a query.
@@ -376,15 +467,22 @@ func (g *Geocoder) BatchUpsertPlaces(ctx context.Context, places []*models.Place
 				return fmt.Errorf("transaction db is not available")
 			}
 
-			query := `
-				INSERT INTO geocoder_places (
+			rows := make([][]any, len(batch))
+			for i, place := range batch {
+				rows[i] = []any{
+					place.ID, place.OSMID, place.OSMType, place.Name, place.Address,
+					place.City, place.State, place.Postcode, place.Country,
+					place.Lat, place.Lon, place.Class, place.Type, place.Importance,
+				}
+			}
+
+			return execMultiValueInsert(txDB,
+				`INSERT INTO geocoder_places (
 					id, osm_id, osm_type, name, address, city, state, postcode, country,
 					lat, lon, class, type, importance, created, updated
-				) VALUES (
-					{:id}, {:osm_id}, {:osm_type}, {:name}, {:address}, {:city}, {:state}, {:postcode}, {:country},
-					{:lat}, {:lon}, {:class}, {:type}, {:importance}, datetime('now'), datetime('now')
-				)
-				ON CONFLICT(id) DO UPDATE SET
+				) VALUES `,
+				`, datetime('now'), datetime('now')`,
+				` ON CONFLICT(id) DO UPDATE SET
 					osm_id = excluded.osm_id,
 					osm_type = excluded.osm_type,
 					name = excluded.name,
@@ -398,31 +496,8 @@ func (g *Geocoder) BatchUpsertPlaces(ctx context.Context, places []*models.Place
 					class = excluded.class,
 					type = excluded.type,
 					importance = excluded.importance,
-					updated = datetime('now')
-			`
-
-			for _, place := range batch {
-				if _, err := txDB.NewQuery(query).Bind(dbx.Params{
-					"id":         place.ID,
-					"osm_id":     place.OSMID,
-					"osm_type":   place.OSMType,
-					"name":       place.Name,
-					"address":    place.Address,
-					"city":       place.City,
-					"state":      place.State,
-					"postcode":   place.Postcode,
-					"country":    place.Country,
-					"lat":        place.Lat,
-					"lon":        place.Lon,
-					"class":      place.Class,
-					"type":       place.Type,
-					"importance": place.Importance,
-				}).Execute(); err != nil {
-					return err
-				}
-			}
-
-			return nil
+					updated = datetime('now')`,
+				rows)
 		})
 
 		if txErr != nil {
@@ -564,18 +639,114 @@ func (g *Geocoder) NeedsFTSRebuild(ctx context.Context) (bool, error) {
 	return hasFTS == 0, nil
 }
 
-// RebuildFTS rebuilds the FTS5 index from the existing geocoder_places data.
-// This is useful after bulk imports that bypassed the FTS triggers.
+// RebuildFTS rebuilds the places FTS5 index from geocoder_places.
+// It runs as a chunked, crash-resumable rebuild (see rebuildFTSIncremental)
+// instead of FTS5's single-transaction 'rebuild' command, which is what made
+// imports fail on low-memory servers: the WAL could not be checkpointed for
+// the duration of a ~54M-row transaction and the whole rebuild rolled back
+// if the process was killed.
 func (g *Geocoder) RebuildFTS(ctx context.Context) error {
+	return g.rebuildFTSIncremental(ctx, "geocoder_places_fts", "geocoder_places",
+		[]string{"name", "address", "city", "state", "postcode"},
+		StateOSMFTSOffset, StateOSMFTSDone)
+}
+
+// rebuildFTSIncremental repopulates an FTS5 external-content index in
+// committed rowid-ordered chunks, persisting progress in _import_state after
+// every chunk so an interrupted rebuild resumes where it left off.
+//
+// Table and column names are internal constants, never user input, so direct
+// SQL interpolation is safe here.
+func (g *Geocoder) rebuildFTSIncremental(ctx context.Context, ftsTable, contentTable string, columns []string, offsetKey, doneKey string) error {
 	db := g.app.NonconcurrentDB()
 	if db == nil {
 		return fmt.Errorf("db is not available")
 	}
 
-	if _, err := db.NewQuery("INSERT INTO geocoder_places_fts(geocoder_places_fts) VALUES('rebuild')").Execute(); err != nil {
-		return fmt.Errorf("rebuild FTS failed: %w", err)
+	chunkSize := defaultFTSRebuildChunkSize
+	if g.cfg != nil && g.cfg.FTSRebuildChunkSize > 0 {
+		chunkSize = g.cfg.FTSRebuildChunkSize
 	}
 
+	colList := strings.Join(columns, ", ")
+
+	// Resume from the last committed chunk if a previous rebuild was interrupted.
+	var after int64
+	switch v, err := g.GetImportState(ctx, offsetKey); {
+	case err != nil:
+		return fmt.Errorf("failed to read %s rebuild progress: %w", ftsTable, err)
+	case v != "":
+		after, _ = strconv.ParseInt(v, 10, 64)
+		log.Printf("%s: resuming interrupted rebuild from rowid %d", ftsTable, after)
+	default:
+		// Fresh rebuild: wipe existing FTS entries (the content table is untouched).
+		if _, err := db.NewQuery(fmt.Sprintf("INSERT INTO %s(%s) VALUES('delete-all')", ftsTable, ftsTable)).Execute(); err != nil {
+			return fmt.Errorf("failed to clear %s: %w", ftsTable, err)
+		}
+	}
+
+	// Upper bound, used only for progress reporting.
+	var maxRowID int64
+	_ = db.NewQuery(fmt.Sprintf("SELECT COALESCE(MAX(rowid), 0) FROM %s", contentTable)).Row(&maxRowID)
+
+	boundQuery := fmt.Sprintf(
+		"SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM (SELECT rowid FROM %s WHERE rowid > {:after} ORDER BY rowid LIMIT {:n})",
+		contentTable)
+	insertQuery := fmt.Sprintf(
+		"INSERT INTO %s(rowid, %s) SELECT rowid, %s FROM %s WHERE rowid > {:after} AND rowid <= {:upto}",
+		ftsTable, colList, colList, contentTable)
+
+	startTime := time.Now()
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		// Find the rowid bounding the next chunk (memory stays bounded
+		// regardless of table size).
+		var upto, count int64
+		if err := db.NewQuery(boundQuery).Bind(dbx.Params{"after": after, "n": chunkSize}).Row(&upto, &count); err != nil {
+			return fmt.Errorf("failed to scan %s for rebuild: %w", contentTable, err)
+		}
+		if count == 0 {
+			break
+		}
+
+		txErr := g.app.RunInTransaction(func(txApp core.App) error {
+			txDB := txApp.NonconcurrentDB()
+			if txDB == nil {
+				return fmt.Errorf("transaction db is not available")
+			}
+			if _, err := txDB.NewQuery(insertQuery).Bind(dbx.Params{"after": after, "upto": upto}).Execute(); err != nil {
+				return err
+			}
+			// Persist progress in the same transaction so a crash resumes
+			// exactly at the last committed chunk.
+			_, err := txDB.NewQuery(`INSERT INTO _import_state (key, value) VALUES ({:key}, {:value})
+				ON CONFLICT(key) DO UPDATE SET value = excluded.value`).
+				Bind(dbx.Params{"key": offsetKey, "value": strconv.FormatInt(upto, 10)}).Execute()
+			return err
+		})
+		if txErr != nil {
+			return fmt.Errorf("%s rebuild failed at rowid %d: %w", ftsTable, upto, txErr)
+		}
+
+		after = upto
+		if maxRowID > 0 {
+			log.Printf("%s rebuild progress: rowid %d/%d (%.0f%%)", ftsTable, after, maxRowID, float64(after)/float64(maxRowID)*100)
+		} else {
+			log.Printf("%s rebuild progress: rowid %d", ftsTable, after)
+		}
+	}
+
+	if err := g.DeleteImportState(ctx, offsetKey); err != nil {
+		log.Printf("warning: failed to clear %s rebuild progress: %v", ftsTable, err)
+	}
+	if err := g.SetImportState(ctx, doneKey, "done"); err != nil {
+		return fmt.Errorf("failed to mark %s rebuild complete: %w", ftsTable, err)
+	}
+
+	log.Printf("%s rebuild complete in %s", ftsTable, time.Since(startTime).Round(time.Second))
 	return nil
 }
 
@@ -596,32 +767,58 @@ func (g *Geocoder) HasZipCache(ctx context.Context) (bool, error) {
 // RebuildZipCache rebuilds the zip_city_state cache table from geocoder_places.
 // This table maps ZIP codes to their most common city/state, enabling fast
 // JOINs in TIGER address interpolation instead of N+1 per-row lookups.
+//
+// Two changes keep this safe on low-memory servers:
+//   - The new table is built alongside the old one and swapped in atomically,
+//     so a crash mid-rebuild can't leave the table missing (which would break
+//     TIGER interpolation queries at runtime).
+//   - The "most common city/state per ZIP" uses SQLite's bare-column-with-MAX
+//     idiom instead of a window function, roughly halving the sort work over
+//     the tens-of-millions-row places table.
 func (g *Geocoder) RebuildZipCache(ctx context.Context) error {
 	db := g.app.NonconcurrentDB()
 	if db == nil {
 		return fmt.Errorf("db is not available")
 	}
 
-	// Drop and recreate the cache table.
-	if _, err := db.NewQuery("DROP TABLE IF EXISTS zip_city_state").Execute(); err != nil {
-		return fmt.Errorf("failed to drop zip cache: %w", err)
+	if _, err := db.NewQuery("DROP TABLE IF EXISTS zip_city_state_new").Execute(); err != nil {
+		return fmt.Errorf("failed to drop stale zip cache: %w", err)
 	}
 
+	// For each postcode, city/state come from the row with the highest count
+	// (documented SQLite behavior for bare columns alongside MAX()).
 	if _, err := db.NewQuery(`
-		CREATE TABLE zip_city_state AS
+		CREATE TABLE zip_city_state_new AS
 		SELECT postcode, city, state FROM (
-			SELECT postcode, city, state, COUNT(*) AS cnt,
-			       ROW_NUMBER() OVER (PARTITION BY postcode ORDER BY COUNT(*) DESC) as rn
-			FROM geocoder_places
-			WHERE city != '' AND postcode != ''
-			GROUP BY postcode, city, state
-		) WHERE rn = 1
+			SELECT postcode, city, state, MAX(cnt) AS cnt FROM (
+				SELECT postcode, city, state, COUNT(*) AS cnt
+				FROM geocoder_places
+				WHERE city != '' AND postcode != ''
+				GROUP BY postcode, city, state
+			) GROUP BY postcode
+		)
 	`).Execute(); err != nil {
 		return fmt.Errorf("failed to build zip cache: %w", err)
 	}
 
-	if _, err := db.NewQuery("CREATE INDEX IF NOT EXISTS idx_zip_city_state ON zip_city_state(postcode)").Execute(); err != nil {
-		return fmt.Errorf("failed to create zip cache index: %w", err)
+	txErr := g.app.RunInTransaction(func(txApp core.App) error {
+		txDB := txApp.NonconcurrentDB()
+		if txDB == nil {
+			return fmt.Errorf("transaction db is not available")
+		}
+		if _, err := txDB.NewQuery("DROP TABLE IF EXISTS zip_city_state").Execute(); err != nil {
+			return err
+		}
+		if _, err := txDB.NewQuery("ALTER TABLE zip_city_state_new RENAME TO zip_city_state").Execute(); err != nil {
+			return err
+		}
+		if _, err := txDB.NewQuery("CREATE INDEX IF NOT EXISTS idx_zip_city_state ON zip_city_state(postcode)").Execute(); err != nil {
+			return err
+		}
+		return nil
+	})
+	if txErr != nil {
+		return fmt.Errorf("failed to swap zip cache table: %w", txErr)
 	}
 
 	return nil
@@ -821,6 +1018,39 @@ func (g *Geocoder) SetImportState(ctx context.Context, key, value string) error 
 	return nil
 }
 
+// DeleteImportState removes a key from the _import_state table.
+func (g *Geocoder) DeleteImportState(ctx context.Context, key string) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	if _, err := db.NewQuery("DELETE FROM _import_state WHERE key = {:key}").
+		Bind(dbx.Params{"key": key}).Execute(); err != nil {
+		return fmt.Errorf("failed to delete import state %s: %w", key, err)
+	}
+	return nil
+}
+
+// Checkpoint flushes the WAL back into the main database file (truncating the
+// WAL) and refreshes query planner statistics. Call after large bulk-write
+// phases to reclaim disk space on small servers. Errors are logged but not
+// treated as fatal.
+func (g *Geocoder) Checkpoint(ctx context.Context) {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return
+	}
+
+	var busy, logFrames, checkpointed int
+	if err := db.NewQuery("PRAGMA wal_checkpoint(TRUNCATE)").Row(&busy, &logFrames, &checkpointed); err != nil {
+		log.Printf("warning: wal_checkpoint failed: %v", err)
+	}
+	if _, err := db.NewQuery("PRAGMA optimize").Execute(); err != nil {
+		log.Printf("warning: PRAGMA optimize failed: %v", err)
+	}
+}
+
 // IsTigerCountyImported returns true if the given county FIPS code has already
 // been imported. This enables resuming an interrupted TIGER import without
 // re-processing completed counties.
@@ -837,15 +1067,15 @@ func (g *Geocoder) MarkTigerCountyImported(ctx context.Context, fips string) err
 	return g.SetImportState(ctx, "tiger_county_"+fips, "done")
 }
 
-// ClearTigerImportState removes all TIGER county progress markers.
-// Called when a full TIGER re-import is forced.
+// ClearTigerImportState removes all TIGER progress markers (per-county markers
+// and FTS rebuild state). Called when a full TIGER re-import is forced.
 func (g *Geocoder) ClearTigerImportState(ctx context.Context) error {
 	db := g.app.NonconcurrentDB()
 	if db == nil {
 		return fmt.Errorf("db is not available")
 	}
 
-	_, err := db.NewQuery("DELETE FROM _import_state WHERE key LIKE 'tiger_county_%'").Execute()
+	_, err := db.NewQuery("DELETE FROM _import_state WHERE key LIKE 'tiger_%'").Execute()
 	if err != nil {
 		return fmt.Errorf("failed to clear tiger import state: %w", err)
 	}
@@ -853,16 +1083,11 @@ func (g *Geocoder) ClearTigerImportState(ctx context.Context) error {
 }
 
 // RebuildTigerFTS rebuilds the TIGER FTS5 index from the tiger_addr_ranges table.
+// Like RebuildFTS, it runs as a chunked, crash-resumable rebuild to keep WAL
+// growth and memory bounded on low-memory servers.
 func (g *Geocoder) RebuildTigerFTS(ctx context.Context) error {
-	db := g.app.NonconcurrentDB()
-	if db == nil {
-		return fmt.Errorf("db is not available")
-	}
-
-	if _, err := db.NewQuery("INSERT INTO tiger_addr_fts(tiger_addr_fts) VALUES('rebuild')").Execute(); err != nil {
-		return fmt.Errorf("rebuild TIGER FTS failed: %w", err)
-	}
-	return nil
+	return g.rebuildFTSIncremental(ctx, "tiger_addr_fts", "tiger_addr_ranges",
+		[]string{"full_name"}, StateTigerFTSOffset, StateTigerFTSDone)
 }
 
 // normalizeStreetName expands common abbreviations so that user queries like
@@ -1105,27 +1330,17 @@ func (g *Geocoder) BatchUpsertAddrRanges(ctx context.Context, ranges []*AddrRang
 				return fmt.Errorf("transaction db is not available")
 			}
 
-			query := `INSERT INTO tiger_addr_ranges (full_name, from_hn, to_hn, parity, zip, side, lat, lon)
-				VALUES ({:full_name}, {:from_hn}, {:to_hn}, {:parity}, {:zip}, {:side}, {:lat}, {:lon})
-				ON CONFLICT(full_name, from_hn, to_hn, side) DO UPDATE SET
-					parity = excluded.parity, zip = excluded.zip, lat = excluded.lat, lon = excluded.lon`
-
-			for _, ar := range batch {
-				if _, err := txDB.NewQuery(query).Bind(dbx.Params{
-					"full_name": ar.FullName,
-					"from_hn":   ar.FromHN,
-					"to_hn":     ar.ToHN,
-					"parity":    ar.Parity,
-					"zip":       ar.ZIP,
-					"side":      ar.Side,
-					"lat":       ar.Lat,
-					"lon":       ar.Lon,
-				}).Execute(); err != nil {
-					return err
-				}
+			rows := make([][]any, len(batch))
+			for i, ar := range batch {
+				rows[i] = []any{ar.FullName, ar.FromHN, ar.ToHN, ar.Parity, ar.ZIP, ar.Side, ar.Lat, ar.Lon}
 			}
 
-			return nil
+			return execMultiValueInsert(txDB,
+				`INSERT INTO tiger_addr_ranges (full_name, from_hn, to_hn, parity, zip, side, lat, lon) VALUES `,
+				"",
+				` ON CONFLICT(full_name, from_hn, to_hn, side) DO UPDATE SET
+					parity = excluded.parity, zip = excluded.zip, lat = excluded.lat, lon = excluded.lon`,
+				rows)
 		})
 
 		if txErr != nil {

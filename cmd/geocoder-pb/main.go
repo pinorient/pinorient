@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 
 	"os"
@@ -44,6 +45,21 @@ func main() {
 	// instead of requiring environment variables to be set explicitly.
 	// Existing environment variables take precedence over .env values.
 	_ = godotenv.Load()
+
+	// Cap the Go heap so the garbage collector works harder before the kernel
+	// OOM killer gets involved. This matters on small (2GB RAM) servers where
+	// the default GC behavior lets the heap grow large enough to get the
+	// process killed mid-import. The SQLite driver (modernc.org/sqlite) is
+	// pure Go, so its page cache is covered by this limit too.
+	//
+	// The standard GOMEMLIMIT environment variable (e.g. "1800MiB") always
+	// wins when set; otherwise GO_MEM_LIMIT_MB applies, defaulting to a
+	// 2GB-server-safe 1500MiB. Set GOMEMLIMIT explicitly on larger servers.
+	if os.Getenv("GOMEMLIMIT") == "" {
+		limitMB := getEnvInt64("GO_MEM_LIMIT_MB", 1500)
+		debug.SetMemoryLimit(limitMB << 20)
+		log.Printf("go memory limit set to %dMiB (override with GOMEMLIMIT or GO_MEM_LIMIT_MB)", limitMB)
+	}
 
 	// Use NewWithConfig to provide a custom DBConnect function with optimized pragmas
 	// for the geocoder database. Cache size and mmap size are configurable via
