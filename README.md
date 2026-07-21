@@ -350,6 +350,13 @@ A single street+number (e.g., `218 Birchwood Rd, Capitan, NM 88316`) typically m
 curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=218+birchwood+rd&bbox=-105.8,33.4,-105.3,33.7"
 ```
 
+- **With a city/state in the query**: trailing tokens after the street suffix (abbreviated or full spelling — `Rd`/`Road`, `Ave`/`Avenue`, `Pkwy`/`Parkway`, etc.) are treated as city/state context, and matching candidates rank ahead of nationwide ones. State abbreviations are recognized:
+
+```bash
+curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=218+birchwood+rd+capitan"
+curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=218+birchwood+rd+nm"
+```
+
 ### Configuration
 
 By default, TIGER/Line data is imported for **all US counties** (~3,200 counties). This provides nationwide address coverage but may take several hours on first import. Source files are deleted as each county completes (unless `TIGER_KEEP_DATA=true`), so the import needs little scratch disk space.

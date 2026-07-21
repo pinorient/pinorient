@@ -1085,7 +1085,7 @@ func (g *Geocoder) RebuildTigerFTS(ctx context.Context) error {
 // "Maple Street" match TIGER data which uses "Maple St".
 func normalizeStreetName(name string) string {
 	name = strings.TrimSpace(name)
-	// Replace whole-word abbreviations (case-insensitive).
+	// Replace whole-word full spellings with TIGER abbreviations (case-insensitive).
 	replacements := []struct{ full, abbr string }{
 		{"Street", "St"},
 		{"Avenue", "Ave"},
@@ -1096,6 +1096,14 @@ func normalizeStreetName(name string) string {
 		{"Court", "Ct"},
 		{"Place", "Pl"},
 		{"Circle", "Cir"},
+		{"Terrace", "Ter"},
+		{"Trail", "Trl"},
+		{"Parkway", "Pkwy"},
+		{"Highway", "Hwy"},
+		{"Square", "Sq"},
+		{"Crossing", "Xing"},
+		{"Turnpike", "Tpke"},
+		{"Alley", "Aly"},
 	}
 	words := strings.Fields(name)
 	for i, w := range words {
@@ -1126,6 +1134,90 @@ func titleCase(s string) string {
 // thousands of ranges). The best `limit` rows are chosen after ranking, so a
 // generous cap is sufficient.
 const exactMatchCap = 500
+
+// usStreetSuffixes are common USPS street suffix tokens (abbreviated and full
+// spellings). The first one in a query marks the end of the street name;
+// anything after it is treated as city/state context.
+//
+// Note: suffix words that also commonly appear INSIDE street names (e.g.
+// "park", "ridge", "creek", "lake", "hill", "valley", "mount") are
+// deliberately excluded — adding them would split "Birchwood Park Dr" or
+// "Birchwood Ridge Pl" at the wrong place.
+var usStreetSuffixes = map[string]bool{
+	"st": true, "street": true,
+	"ave": true, "avenue": true,
+	"rd": true, "road": true,
+	"dr": true, "drive": true,
+	"ln": true, "lane": true,
+	"ct": true, "court": true,
+	"blvd": true, "boulevard": true,
+	"pl": true, "place": true,
+	"cir": true, "circle": true,
+	"ter": true, "terrace": true,
+	"trl": true, "trail": true,
+	"pkwy": true, "parkway": true,
+	"hwy": true, "highway": true,
+	"sq": true, "square": true,
+	"xing": true, "crossing": true,
+	"way": true, "loop": true,
+	"pass": true, "path": true, "row": true, "run": true, "walk": true,
+	"aly": true, "alley": true,
+	"pike": true, "tpke": true, "turnpike": true,
+}
+
+// usStateAbbrevs is the set of valid US state/territory abbreviations, used to
+// detect a trailing state token in a query (e.g. "... capitan nm").
+var usStateAbbrevs = map[string]bool{
+	"AL": true, "AK": true, "AZ": true, "AR": true, "CA": true,
+	"CO": true, "CT": true, "DE": true, "DC": true, "FL": true,
+	"GA": true, "HI": true, "ID": true, "IL": true, "IN": true,
+	"IA": true, "KS": true, "KY": true, "LA": true, "ME": true,
+	"MD": true, "MA": true, "MI": true, "MN": true, "MS": true,
+	"MO": true, "MT": true, "NE": true, "NV": true, "NH": true,
+	"NJ": true, "NM": true, "NY": true, "NC": true, "ND": true,
+	"OH": true, "OK": true, "OR": true, "PA": true, "RI": true,
+	"SC": true, "SD": true, "TN": true, "TX": true, "UT": true,
+	"VT": true, "VA": true, "WA": true, "WV": true, "WI": true,
+	"WY": true, "PR": true,
+}
+
+// likeWildcardReplacer removes LIKE wildcard characters from user input so the
+// city context filter treats them literally.
+var likeWildcardReplacer = strings.NewReplacer("%", "", "_", "")
+
+// splitStreetContext splits a street query like "birchwood rd capitan nm"
+// into the street part ("birchwood rd") and trailing city/state context
+// ("capitan nm") at the first recognized street suffix. Returns the full
+// string as the street and an empty context when no suffix boundary is found.
+func splitStreetContext(s string) (street, context string) {
+	tokens := strings.Fields(s)
+	// Start at index 1: a suffix as the very first token can't end the street
+	// name (e.g. "St Marys Rd" where "St" means "Saint").
+	for i := 1; i < len(tokens); i++ {
+		if usStreetSuffixes[strings.ToLower(strings.TrimRight(tokens[i], "."))] {
+			if i+1 < len(tokens) {
+				return strings.Join(tokens[:i+1], " "), strings.Join(tokens[i+1:], " ")
+			}
+			return s, ""
+		}
+	}
+	return s, ""
+}
+
+// splitContextState extracts a trailing US state abbreviation from a query's
+// city/state context, e.g. "capitan nm" -> ("capitan", "NM").
+// Returns the full context as city when no state token is found.
+func splitContextState(context string) (city, state string) {
+	tokens := strings.Fields(context)
+	if len(tokens) == 0 {
+		return "", ""
+	}
+	last := strings.ToUpper(strings.TrimRight(tokens[len(tokens)-1], "."))
+	if usStateAbbrevs[last] {
+		return strings.Join(tokens[:len(tokens)-1], " "), last
+	}
+	return context, ""
+}
 
 // tigerAddrRow represents a row from the tiger_addr_ranges table.
 type tigerAddrRow struct {
@@ -1161,6 +1253,10 @@ type tigerAddrRow struct {
 // deterministic across databases, unlike rowid order, which depends on
 // import order and made the top-N cut arbitrary for streets with many
 // nationwide candidates.
+//
+// City/state context: trailing tokens after the street suffix are treated as
+// city/state context (e.g. "birchwood rd capitan nm"), and matching
+// candidates are ranked ahead of unfiltered nationwide ones.
 func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string, limit int, bbox *BBox) ([]models.Place, error) {
 	if limit <= 0 {
 		limit = 10
@@ -1247,46 +1343,100 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		sharedParams["lon_scale"] = lonScale
 	}
 
+	// Split trailing city/state context off the street name, e.g.
+	// "birchwood rd capitan nm" -> street "birchwood rd", city
+	// "capitan", state "NM". City/state-filtered matches rank first;
+	// unfiltered nationwide candidates are appended after them.
+	streetPart, contextPart := splitStreetContext(streetName)
+	cityCtx, stateCtx := splitContextState(contextPart)
+	cityWhere := ""
+	cityParams := dbx.Params{}
+	if cityCtx != "" {
+		cityWhere = " AND z.city LIKE {:city_ctx}"
+		cityParams["city_ctx"] = likeWildcardReplacer.Replace(cityCtx) + "%"
+	}
+	if stateCtx != "" {
+		cityWhere += " AND z.state = {:state_ctx}"
+		cityParams["state_ctx"] = stateCtx
+	}
+
 	// Note: COALESCE is required because zip_city_state doesn't cover every ZIP;
 	// without it, scanning NULL city/state into strings fails and the whole
 	// interpolation silently returns no results.
-	exactQuery := fmt.Sprintf(`
-		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
-		       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
-		FROM tiger_addr_ranges t
-		LEFT JOIN zip_city_state z ON z.postcode = t.zip
-		WHERE t.full_name IN ({:street1}, {:street2})
-		  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
-		  AND (t.parity = {:parity} OR t.parity = 'B')
-		  %s
-		%s
-		LIMIT {:cap}
-	`, bboxWhere, orderBy)
-	exactParams := dbx.Params{
-		"street1": titleCased,
-		"street2": normalized,
-		"hn":      houseNumber,
-		"parity":  parity,
-		"cap":     exactMatchCap,
+	// runExact executes one exact-name lookup pass with an optional extra
+	// WHERE fragment (the city/state filter).
+	runExact := func(street1, street2, extraWhere string, extraParams dbx.Params) error {
+		exactQuery := fmt.Sprintf(`
+			SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
+			       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
+			FROM tiger_addr_ranges t
+			LEFT JOIN zip_city_state z ON z.postcode = t.zip
+			WHERE t.full_name IN ({:street1}, {:street2})
+			  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
+			  AND (t.parity = {:parity} OR t.parity = 'B')
+			  %s
+			  %s
+			%s
+			LIMIT {:cap}
+		`, bboxWhere, extraWhere, orderBy)
+		exactParams := dbx.Params{
+			"street1": street1,
+			"street2": street2,
+			"hn":      houseNumber,
+			"parity":  parity,
+			"cap":     exactMatchCap,
+		}
+		for k, v := range sharedParams {
+			exactParams[k] = v
+		}
+		for k, v := range extraParams {
+			exactParams[k] = v
+		}
+		var exactRows []tigerAddrRow
+		if err := db.NewQuery(exactQuery).Bind(exactParams).All(&exactRows); err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("tiger address lookup failed: %w", err)
+		}
+		buildPlaces(exactRows)
+		return nil
 	}
-	for k, v := range sharedParams {
-		exactParams[k] = v
-	}
-	var exactRows []tigerAddrRow
-	if err := db.NewQuery(exactQuery).Bind(exactParams).All(&exactRows); err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("tiger address lookup failed: %w", err)
-	}
-	buildPlaces(exactRows)
 
-	// If we have enough results, return early.
-	if len(results) >= limit {
+	enough := func() bool { return len(results) >= limit }
+
+	// 1a. Exact match on the street part with the city/state context filter
+	// (most specific intent, e.g. "Birchwood Rd" in Capitan).
+	if cityWhere != "" {
+		if err := runExact(titleCase(streetPart), titleCase(normalizeStreetName(streetPart)), cityWhere, cityParams); err != nil {
+			return nil, err
+		}
+		if enough() {
+			return results[:limit], nil
+		}
+	}
+
+	// 1b. Exact match on the full street string (covers street names that
+	// legitimately contain the context word, and is the no-context path).
+	if err := runExact(titleCased, normalized, "", nil); err != nil {
+		return nil, err
+	}
+	if enough() {
 		return results[:limit], nil
 	}
 
-	// 2. Fall back to FTS prefix match on the first word.
+	// 1c. Exact match on the street part without the city filter, so
+	// nationwide candidates still appear after city-filtered ones.
+	if streetPart != streetName {
+		if err := runExact(titleCase(streetPart), titleCase(normalizeStreetName(streetPart)), "", nil); err != nil {
+			return nil, err
+		}
+		if enough() {
+			return results[:limit], nil
+		}
+	}
+
+	// 2. Fall back to FTS prefix match on the first word of the street part.
 	// This uses the tiger_addr_fts index instead of a LIKE full table scan.
 	// e.g., "main*" matches "Main St", "Main Rd", "Maine St", etc.
-	if parts := strings.Fields(streetName); len(parts) > 0 {
+	if parts := strings.Fields(streetPart); len(parts) > 0 {
 		remaining := limit - len(results)
 		ftsQuery := parts[0] + "*"
 		ftsQuerySQL := fmt.Sprintf(`
