@@ -341,6 +341,15 @@ In addition to OSM data, `geocoder-pb` imports [TIGER/Line](https://www.census.g
 
 When a search or autocomplete query starts with a house number (e.g., `42 Maple Street`), the geocoder looks up matching TIGER address ranges and interpolates the coordinates. City and state names are enriched from OSM data using the ZIP code, since TIGER ADDRFEAT only contains ZIP codes.
 
+A single street+number (e.g., `218 Birchwood Rd, Capitan, NM 88316`) typically matches ranges in many cities nationwide. Candidates are ranked deterministically:
+
+- **Without a `bbox`**: by interpolation precision (narrowest address range first).
+- **With a `bbox`**: candidates are filtered to the box and ordered by proximity to its center. Pass your map viewport or the user's approximate location as `bbox` to get region-relevant candidates first:
+
+```bash
+curl "http://127.0.0.1:8090/api/geocoder/autocomplete?q=218+birchwood+rd&bbox=-105.8,33.4,-105.3,33.7"
+```
+
 ### Configuration
 
 By default, TIGER/Line data is imported for **all US counties** (~3,200 counties). This provides nationwide address coverage but may take several hours on first import. Source files are deleted as each county completes (unless `TIGER_KEEP_DATA=true`), so the import needs little scratch disk space.

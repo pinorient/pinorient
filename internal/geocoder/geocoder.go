@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -177,20 +178,12 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 
 	// Try TIGER address interpolation if the query starts with a house number.
 	if houseNum, streetName, ok := parseHouseNumber(q); ok {
-		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, limit)
+		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, limit, bbox)
 		if err != nil {
 			// Interpolation is best-effort; log and continue with OSM results.
 			g.app.Logger().Warn("tiger interpolation failed", "error", err, "query", q)
 		}
-		for i := range tigerPlaces {
-			tp := &tigerPlaces[i]
-			// Apply bbox filter to TIGER result if needed.
-			if bbox == nil || !bbox.Valid() ||
-				(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
-					tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
-				places = append(places, *tp)
-			}
-		}
+		places = append(places, tigerPlaces...)
 	}
 
 	// Use FTS5 to match the query across indexed fields.
@@ -296,22 +289,12 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		if maxTiger < 3 {
 			maxTiger = 3
 		}
-		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, maxTiger)
+		tigerPlaces, err := g.InterpolateAddress(ctx, houseNum, streetName, maxTiger, bbox)
 		if err != nil {
 			// Interpolation is best-effort; log and continue with OSM results.
 			g.app.Logger().Warn("tiger interpolation failed", "error", err, "query", q)
 		}
-		var filtered []models.Place
-		for i := range tigerPlaces {
-			tp := &tigerPlaces[i]
-			// Apply bbox filter to TIGER result if needed.
-			if bbox == nil || !bbox.Valid() ||
-				(tp.Lat >= bbox.MinLat && tp.Lat <= bbox.MaxLat &&
-					tp.Lon >= bbox.MinLng && tp.Lon <= bbox.MaxLng) {
-				filtered = append(filtered, *tp)
-			}
-		}
-		places = append(filtered, places...)
+		places = append(tigerPlaces, places...)
 	}
 	if len(places) > limit {
 		places = places[:limit]
@@ -1138,6 +1121,12 @@ func titleCase(s string) string {
 	return strings.Join(words, " ")
 }
 
+// exactMatchCap bounds how many nationwide TIGER candidates are fetched for a
+// single street+number lookup before ranking (e.g. "Main St" matches tens of
+// thousands of ranges). The best `limit` rows are chosen after ranking, so a
+// generous cap is sufficient.
+const exactMatchCap = 500
+
 // tigerAddrRow represents a row from the tiger_addr_ranges table.
 type tigerAddrRow struct {
 	FullName string  `db:"full_name"`
@@ -1164,7 +1153,15 @@ type tigerAddrRow struct {
 //
 // The limit parameter controls the maximum number of results returned, which
 // prevents fetching and enriching thousands of rows for common street names.
-func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string, limit int) ([]models.Place, error) {
+//
+// Candidate ranking: when a bbox is provided, candidates are filtered to it
+// and ordered by proximity to its center (squared distance, longitude scaled
+// by cos(center latitude)); otherwise they are ordered by interpolation
+// precision (narrowest address range first). Precision ordering is
+// deterministic across databases, unlike rowid order, which depends on
+// import order and made the top-N cut arbitrary for streets with many
+// nationwide candidates.
+func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, streetName string, limit int, bbox *BBox) ([]models.Place, error) {
 	if limit <= 0 {
 		limit = 10
 	}
@@ -1223,16 +1220,37 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 
 	// 1. Try exact match on original and normalized street names.
 	// This handles cases where the user types "Maple Street" but TIGER has "Maple St".
-	// No LIMIT here — the full_name index makes this fast, and we need all matches so the
-	// caller can present different cities/states as autocomplete options.
 	// Title-case the street name to match TIGER's naming convention (e.g., "Birchwood Rd").
 	// This enables case-sensitive index lookups which are much faster than COLLATE NOCASE.
 	titleCased := titleCase(streetName)
 	normalized := titleCase(normalizeStreetName(streetName))
+
+	// Build the shared bbox filter and ranking clause (see the function doc).
+	bboxWhere := ""
+	orderBy := "ORDER BY ABS(t.to_hn - t.from_hn), t.rowid"
+	sharedParams := dbx.Params{}
+	if bbox != nil && bbox.Valid() {
+		cLat := (bbox.MinLat + bbox.MaxLat) / 2
+		cLon := (bbox.MinLng + bbox.MaxLng) / 2
+		lonScale := math.Cos(cLat * math.Pi / 180)
+		bboxWhere = `AND t.lat >= {:min_lat} AND t.lat <= {:max_lat}
+		  AND t.lon >= {:min_lng} AND t.lon <= {:max_lng}`
+		orderBy = `ORDER BY (t.lat - {:c_lat}) * (t.lat - {:c_lat}) +
+		                    (t.lon - {:c_lon}) * (t.lon - {:c_lon}) * {:lon_scale} * {:lon_scale},
+		                    ABS(t.to_hn - t.from_hn), t.rowid`
+		sharedParams["min_lat"] = bbox.MinLat
+		sharedParams["max_lat"] = bbox.MaxLat
+		sharedParams["min_lng"] = bbox.MinLng
+		sharedParams["max_lng"] = bbox.MaxLng
+		sharedParams["c_lat"] = cLat
+		sharedParams["c_lon"] = cLon
+		sharedParams["lon_scale"] = lonScale
+	}
+
 	// Note: COALESCE is required because zip_city_state doesn't cover every ZIP;
 	// without it, scanning NULL city/state into strings fails and the whole
 	// interpolation silently returns no results.
-	exactQuery := `
+	exactQuery := fmt.Sprintf(`
 		SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
 		       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
 		FROM tiger_addr_ranges t
@@ -1240,15 +1258,22 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 		WHERE t.full_name IN ({:street1}, {:street2})
 		  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
 		  AND (t.parity = {:parity} OR t.parity = 'B')
-		ORDER BY t.rowid
-	`
-	var exactRows []tigerAddrRow
-	if err := db.NewQuery(exactQuery).Bind(dbx.Params{
+		  %s
+		%s
+		LIMIT {:cap}
+	`, bboxWhere, orderBy)
+	exactParams := dbx.Params{
 		"street1": titleCased,
 		"street2": normalized,
 		"hn":      houseNumber,
 		"parity":  parity,
-	}).All(&exactRows); err != nil && err != sql.ErrNoRows {
+		"cap":     exactMatchCap,
+	}
+	for k, v := range sharedParams {
+		exactParams[k] = v
+	}
+	var exactRows []tigerAddrRow
+	if err := db.NewQuery(exactQuery).Bind(exactParams).All(&exactRows); err != nil && err != sql.ErrNoRows {
 		return nil, fmt.Errorf("tiger address lookup failed: %w", err)
 	}
 	buildPlaces(exactRows)
@@ -1264,7 +1289,7 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 	if parts := strings.Fields(streetName); len(parts) > 0 {
 		remaining := limit - len(results)
 		ftsQuery := parts[0] + "*"
-		ftsQuerySQL := `
+		ftsQuerySQL := fmt.Sprintf(`
 			SELECT t.full_name, t.from_hn, t.to_hn, t.parity, t.zip, t.side, t.lat, t.lon,
 			       COALESCE(z.city, '') AS city, COALESCE(z.state, '') AS state
 			FROM tiger_addr_ranges t
@@ -1273,15 +1298,21 @@ func (g *Geocoder) InterpolateAddress(ctx context.Context, houseNumber int, stre
 			WHERE tiger_addr_fts MATCH {:fts_query}
 			  AND ((t.from_hn <= {:hn} AND t.to_hn >= {:hn}) OR (t.to_hn <= {:hn} AND t.from_hn >= {:hn}))
 			  AND (t.parity = {:parity} OR t.parity = 'B')
-		LIMIT {:limit}
-		`
-		var ftsRows []tigerAddrRow
-		if err := db.NewQuery(ftsQuerySQL).Bind(dbx.Params{
+			  %s
+			%s
+			LIMIT {:limit}
+		`, bboxWhere, orderBy)
+		ftsParams := dbx.Params{
 			"fts_query": ftsQuery,
 			"hn":        houseNumber,
 			"parity":    parity,
 			"limit":     remaining,
-		}).All(&ftsRows); err != nil && err != sql.ErrNoRows {
+		}
+		for k, v := range sharedParams {
+			ftsParams[k] = v
+		}
+		var ftsRows []tigerAddrRow
+		if err := db.NewQuery(ftsQuerySQL).Bind(ftsParams).All(&ftsRows); err != nil && err != sql.ErrNoRows {
 			return nil, fmt.Errorf("tiger address lookup failed: %w", err)
 		}
 		buildPlaces(ftsRows)
