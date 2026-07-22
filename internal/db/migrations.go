@@ -120,6 +120,11 @@ func RunMigrations(app core.App) error {
 	// 5. Create the TIGER/Line address ranges table for address interpolation.
 	//    This is a raw SQL table (not a PocketBase collection) because it's
 	//    used internally by the geocoder for interpolation, not exposed via admin UI.
+	// Note: no explicit indexes are created for tiger_addr_ranges. The UNIQUE
+	// constraint's implicit index has full_name as its leftmost column, which
+	// covers name lookups; the former idx_tiger_addr_full_name and
+	// idx_tiger_addr_hn indexes were redundant and cost ~2GB+ of one-time
+	// index-build work on large tables.
 	tigerQueries := []string{
 		`CREATE TABLE IF NOT EXISTS tiger_addr_ranges (
 			full_name TEXT NOT NULL,
@@ -132,8 +137,6 @@ func RunMigrations(app core.App) error {
 			lon REAL NOT NULL,
 			UNIQUE(full_name, from_hn, to_hn, side, zip)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_full_name ON tiger_addr_ranges(full_name)`,
-		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_hn ON tiger_addr_ranges(from_hn, to_hn)`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS tiger_addr_fts USING fts5(
 			full_name,
 			content='tiger_addr_ranges'
@@ -222,10 +225,22 @@ func migrateTigerZipConflictKey(app core.App) error {
 	var after int64
 	var offset string
 	_ = db.NewQuery("SELECT value FROM _import_state WHERE key = {:key}").Bind(dbx.Params{"key": offsetKey}).Row(&offset)
-	if offset != "" {
+
+	// Sanity check: a resume marker without the working table is inconsistent
+	// (e.g. the table was dropped externally) — start over cleanly.
+	newTableExists := 0
+	_ = db.NewQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tiger_addr_ranges_new'").Row(&newTableExists)
+
+	if offset != "" && newTableExists > 0 {
 		after, _ = strconv.ParseInt(offset, 10, 64)
 		log.Printf("resuming tiger_addr_ranges conflict key migration from rowid %d", after)
 	} else {
+		if offset != "" {
+			log.Printf("warning: migration resume marker exists but the working table is gone; restarting migration")
+			if _, err := db.NewQuery("DELETE FROM _import_state WHERE key = {:key}").Bind(dbx.Params{"key": offsetKey}).Execute(); err != nil {
+				return fmt.Errorf("failed to reset migration state: %w", err)
+			}
+		}
 		log.Printf("migrating tiger_addr_ranges to zip-aware conflict key (one-time table rebuild)...")
 		setup := []string{
 			"DROP TABLE IF EXISTS tiger_addr_ranges_new",
@@ -290,16 +305,19 @@ func migrateTigerZipConflictKey(app core.App) error {
 	}
 
 	// Swap atomically (and clear the resume marker in the same transaction).
+	// Only renames: dropping the ~33M-row old table in one transaction writes
+	// every freed page to the WAL freelist (fatal on small servers), and index
+	// builds are unnecessary — the UNIQUE constraint's implicit index covers
+	// full_name lookups. The old table is cleaned up afterwards in bounded
+	// chunks by Geocoder.CleanupOldTigerTable once the server is up.
 	txErr := app.RunInTransaction(func(txApp core.App) error {
 		txDB := txApp.NonconcurrentDB()
 		if txDB == nil {
 			return fmt.Errorf("transaction db is not available")
 		}
 		stmts := []string{
-			"DROP TABLE tiger_addr_ranges",
+			"ALTER TABLE tiger_addr_ranges RENAME TO tiger_addr_ranges_old",
 			"ALTER TABLE tiger_addr_ranges_new RENAME TO tiger_addr_ranges",
-			"CREATE INDEX IF NOT EXISTS idx_tiger_addr_full_name ON tiger_addr_ranges(full_name)",
-			"CREATE INDEX IF NOT EXISTS idx_tiger_addr_hn ON tiger_addr_ranges(from_hn, to_hn)",
 			"DELETE FROM _import_state WHERE key = '" + offsetKey + "'",
 		}
 		for _, q := range stmts {
@@ -319,7 +337,7 @@ func migrateTigerZipConflictKey(app core.App) error {
 		log.Printf("warning: failed to clear TIGER FTS state after migration: %v", err)
 	}
 
-	log.Printf("tiger_addr_ranges conflict key migration complete in %s", time.Since(startTime).Round(time.Second))
+	log.Printf("tiger_addr_ranges conflict key migration complete in %s (old table cleanup runs in the background)", time.Since(startTime).Round(time.Second))
 	return nil
 }
 

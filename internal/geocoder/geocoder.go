@@ -1062,6 +1062,67 @@ func (g *Geocoder) MarkTigerCountyImported(ctx context.Context, fips string, row
 	return g.SetImportState(ctx, "tiger_county_"+fips, fmt.Sprintf("done:%d", rows))
 }
 
+// CleanupOldTigerTable removes the pre-migration tiger_addr_ranges_old table
+// left behind by the one-time conflict-key migration. The old table's rows are
+// deleted in committed chunks — dropping a ~33M-row table outright writes
+// every freed page to the WAL freelist in one transaction, which is fatal on
+// small servers. The final DROP of the empty table is metadata-only. Safe to
+// call on every startup: it is a no-op when the table is absent, and it
+// resumes wherever it stopped if interrupted.
+func (g *Geocoder) CleanupOldTigerTable(ctx context.Context) error {
+	db := g.app.DB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	var exists int
+	_ = db.NewQuery("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='tiger_addr_ranges_old'").Row(&exists)
+	if exists == 0 {
+		return nil
+	}
+
+	log.Printf("cleaning up pre-migration tiger_addr_ranges_old table (chunked delete)...")
+	const chunkSize = 250000
+	startTime := time.Now()
+	deleted := int64(0)
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		var n int64
+		txErr := g.app.RunInTransaction(func(txApp core.App) error {
+			txDB := txApp.NonconcurrentDB()
+			if txDB == nil {
+				return fmt.Errorf("transaction db is not available")
+			}
+			res, err := txDB.NewQuery(
+				"DELETE FROM tiger_addr_ranges_old WHERE rowid IN (SELECT rowid FROM tiger_addr_ranges_old LIMIT {:n})",
+			).Bind(dbx.Params{"n": chunkSize}).Execute()
+			if err != nil {
+				return err
+			}
+			n, _ = res.RowsAffected()
+			return nil
+		})
+		if txErr != nil {
+			return fmt.Errorf("failed to delete old tiger rows: %w", txErr)
+		}
+		if n == 0 {
+			break
+		}
+		deleted += n
+		log.Printf("old tiger table cleanup progress: deleted %d rows", deleted)
+	}
+
+	if _, err := db.NewQuery("DROP TABLE tiger_addr_ranges_old").Execute(); err != nil {
+		return fmt.Errorf("failed to drop tiger_addr_ranges_old: %w", err)
+	}
+
+	log.Printf("old tiger table cleanup complete: deleted %d rows in %s", deleted, time.Since(startTime).Round(time.Second))
+	return nil
+}
+
 // ReviewTigerMarkers returns counties whose TIGER import markers look
 // suspicious: legacy "done" markers without a recorded row count (their
 // completeness can't be verified), and "done:0" markers (the import completed

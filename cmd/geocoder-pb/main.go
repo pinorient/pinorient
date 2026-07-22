@@ -103,6 +103,11 @@ func main() {
 				if err := scheduler.EnsureIndexed(context.Background(), app); err != nil {
 					app.Logger().Error("osm indexing failed", "error", err)
 				}
+				// Remove the pre-migration TIGER table (if any) in bounded
+				// chunks before the TIGER phase starts writing.
+				if err := geo.CleanupOldTigerTable(context.Background()); err != nil {
+					app.Logger().Error("tiger pre-migration cleanup failed", "error", err)
+				}
 				if err := scheduler.EnsureTigerIndexed(context.Background(), app); err != nil {
 					app.Logger().Error("tiger indexing failed", "error", err)
 				}
@@ -111,6 +116,13 @@ func main() {
 			go func() {
 				if err := scheduler.EnsureIndexed(context.Background(), app); err != nil {
 					app.Logger().Error("osm indexing failed", "error", err)
+				}
+			}()
+
+			// Remove the pre-migration TIGER table (if any) in bounded chunks.
+			go func() {
+				if err := geo.CleanupOldTigerTable(context.Background()); err != nil {
+					app.Logger().Error("tiger pre-migration cleanup failed", "error", err)
 				}
 			}()
 
