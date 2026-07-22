@@ -2,9 +2,14 @@ package db
 
 import (
 	"fmt"
+	"log"
+	"strconv"
+	"strings"
 
 	"os"
+	"time"
 
+	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 )
 
@@ -125,7 +130,7 @@ func RunMigrations(app core.App) error {
 			side TEXT NOT NULL,
 			lat REAL NOT NULL,
 			lon REAL NOT NULL,
-			UNIQUE(full_name, from_hn, to_hn, side)
+			UNIQUE(full_name, from_hn, to_hn, side, zip)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_full_name ON tiger_addr_ranges(full_name)`,
 		`CREATE INDEX IF NOT EXISTS idx_tiger_addr_hn ON tiger_addr_ranges(from_hn, to_hn)`,
@@ -138,6 +143,14 @@ func RunMigrations(app core.App) error {
 		if _, err := db.NewQuery(q).Execute(); err != nil {
 			return fmt.Errorf("tiger migration failed: %w", err)
 		}
+	}
+
+	// 5b. Fix the tiger_addr_ranges conflict key on existing databases: the
+	// original UNIQUE constraint did not include zip, so identical address
+	// ranges in different ZIPs (same street name, house number range, and
+	// side) collapsed into one row whose ZIP depended on import order.
+	if err := migrateTigerZipConflictKey(app); err != nil {
+		return fmt.Errorf("tiger conflict key migration failed: %w", err)
 	}
 
 	// 6. Create the zip_city_state cache table (empty; populated by scheduler).
@@ -169,6 +182,144 @@ func RunMigrations(app core.App) error {
 		return fmt.Errorf("import state migration failed: %w", err)
 	}
 
+	return nil
+}
+
+// migrateTigerZipConflictKey rebuilds tiger_addr_ranges with the zip-aware
+// UNIQUE constraint when the table still has the legacy constraint.
+//
+// SQLite cannot alter constraints (and auto-indexes backing UNIQUE constraints
+// can't be dropped), so the table is rebuilt: rows are copied in committed
+// rowid-ordered chunks (preserving rowids so the external-content FTS stays
+// valid until its rebuild), progress is persisted per chunk so an interrupted
+// migration resumes where it stopped, and the swap is atomic.
+//
+// Note: the copy preserves whatever rows exist, but rows previously LOST to
+// conflict-key collisions can only be restored by re-importing the affected
+// counties (delete their tiger_county_* markers after upgrading).
+func migrateTigerZipConflictKey(app core.App) error {
+	db := app.DB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	var tableSQL string
+	_ = db.NewQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='tiger_addr_ranges'").Row(&tableSQL)
+	if tableSQL == "" || strings.Contains(tableSQL, "UNIQUE(full_name, from_hn, to_hn, side, zip)") {
+		return nil // Fresh install (new schema) or already migrated.
+	}
+
+	// _import_state is created later in RunMigrations on first installs; the
+	// migration needs it now for resume tracking.
+	if _, err := db.NewQuery(`CREATE TABLE IF NOT EXISTS _import_state (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	)`).Execute(); err != nil {
+		return fmt.Errorf("failed to ensure import state table: %w", err)
+	}
+
+	const offsetKey = "tiger_zip_migration_offset"
+	var after int64
+	var offset string
+	_ = db.NewQuery("SELECT value FROM _import_state WHERE key = {:key}").Bind(dbx.Params{"key": offsetKey}).Row(&offset)
+	if offset != "" {
+		after, _ = strconv.ParseInt(offset, 10, 64)
+		log.Printf("resuming tiger_addr_ranges conflict key migration from rowid %d", after)
+	} else {
+		log.Printf("migrating tiger_addr_ranges to zip-aware conflict key (one-time table rebuild)...")
+		setup := []string{
+			"DROP TABLE IF EXISTS tiger_addr_ranges_new",
+			`CREATE TABLE tiger_addr_ranges_new (
+				full_name TEXT NOT NULL,
+				from_hn INTEGER NOT NULL,
+				to_hn INTEGER NOT NULL,
+				parity TEXT NOT NULL,
+				zip TEXT,
+				side TEXT NOT NULL,
+				lat REAL NOT NULL,
+				lon REAL NOT NULL,
+				UNIQUE(full_name, from_hn, to_hn, side, zip)
+			)`,
+		}
+		for _, q := range setup {
+			if _, err := db.NewQuery(q).Execute(); err != nil {
+				return fmt.Errorf("failed to create replacement table: %w", err)
+			}
+		}
+	}
+
+	const chunkSize = 250000
+	copyInsert := `INSERT INTO tiger_addr_ranges_new
+		(rowid, full_name, from_hn, to_hn, parity, zip, side, lat, lon)
+		SELECT rowid, full_name, from_hn, to_hn, parity, zip, side, lat, lon
+		FROM tiger_addr_ranges WHERE rowid > {:after} AND rowid <= {:upto}`
+
+	startTime := time.Now()
+	for {
+		var upto, count int64
+		if err := db.NewQuery(
+			"SELECT COALESCE(MAX(rowid), 0), COUNT(*) FROM (SELECT rowid FROM tiger_addr_ranges WHERE rowid > {:after} ORDER BY rowid LIMIT {:n})",
+		).Bind(dbx.Params{"after": after, "n": chunkSize}).Row(&upto, &count); err != nil {
+			return fmt.Errorf("failed to scan tiger_addr_ranges: %w", err)
+		}
+		if count == 0 {
+			break
+		}
+
+		txErr := app.RunInTransaction(func(txApp core.App) error {
+			txDB := txApp.NonconcurrentDB()
+			if txDB == nil {
+				return fmt.Errorf("transaction db is not available")
+			}
+			if _, err := txDB.NewQuery(copyInsert).Bind(dbx.Params{"after": after, "upto": upto}).Execute(); err != nil {
+				return err
+			}
+			// Persist progress in the same transaction so a crash resumes
+			// exactly at the last committed chunk.
+			_, err := txDB.NewQuery(`INSERT INTO _import_state (key, value) VALUES ({:key}, {:value})
+				ON CONFLICT(key) DO UPDATE SET value = excluded.value`).
+				Bind(dbx.Params{"key": offsetKey, "value": strconv.FormatInt(upto, 10)}).Execute()
+			return err
+		})
+		if txErr != nil {
+			return fmt.Errorf("migration copy failed at rowid %d: %w", upto, txErr)
+		}
+
+		after = upto
+		log.Printf("tiger_addr_ranges migration progress: rowid %d", after)
+	}
+
+	// Swap atomically (and clear the resume marker in the same transaction).
+	txErr := app.RunInTransaction(func(txApp core.App) error {
+		txDB := txApp.NonconcurrentDB()
+		if txDB == nil {
+			return fmt.Errorf("transaction db is not available")
+		}
+		stmts := []string{
+			"DROP TABLE tiger_addr_ranges",
+			"ALTER TABLE tiger_addr_ranges_new RENAME TO tiger_addr_ranges",
+			"CREATE INDEX IF NOT EXISTS idx_tiger_addr_full_name ON tiger_addr_ranges(full_name)",
+			"CREATE INDEX IF NOT EXISTS idx_tiger_addr_hn ON tiger_addr_ranges(from_hn, to_hn)",
+			"DELETE FROM _import_state WHERE key = '" + offsetKey + "'",
+		}
+		for _, q := range stmts {
+			if _, err := txDB.NewQuery(q).Execute(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if txErr != nil {
+		return fmt.Errorf("failed to swap rebuilt tiger_addr_ranges: %w", txErr)
+	}
+
+	// The FTS index was built under the legacy conflict key (and is missing
+	// the rows lost to collisions): force a rebuild on the next scheduler pass.
+	if _, err := db.NewQuery("DELETE FROM _import_state WHERE key IN ('tiger_fts_done', 'tiger_fts_offset')").Execute(); err != nil {
+		log.Printf("warning: failed to clear TIGER FTS state after migration: %v", err)
+	}
+
+	log.Printf("tiger_addr_ranges conflict key migration complete in %s", time.Since(startTime).Round(time.Second))
 	return nil
 }
 

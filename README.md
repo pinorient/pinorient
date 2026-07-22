@@ -376,6 +376,14 @@ TIGER_FORCE_REIMPORT=1 ./geocoder-pb serve
 
 ### Verifying the Import
 
+> **Note (schema fix):** older versions deduplicated address ranges on
+> `(street, range, side)` without the ZIP, so identical ranges in different
+> ZIPs collapsed into one row in import order. Current versions use a
+> ZIP-aware conflict key and rebuild the table automatically on first startup
+> (one-time, chunked and crash-resumable). Rows already lost to that bug are
+> only restored by re-importing: `DELETE FROM _import_state WHERE key LIKE
+> 'tiger_county_%';` and restart.
+
 Check the number of imported address ranges:
 
 ```bash

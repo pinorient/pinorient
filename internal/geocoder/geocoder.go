@@ -1564,8 +1564,8 @@ func (g *Geocoder) BatchUpsertAddrRanges(ctx context.Context, ranges []*AddrRang
 			return execMultiValueInsert(txDB,
 				`INSERT INTO tiger_addr_ranges (full_name, from_hn, to_hn, parity, zip, side, lat, lon) VALUES `,
 				"",
-				` ON CONFLICT(full_name, from_hn, to_hn, side) DO UPDATE SET
-					parity = excluded.parity, zip = excluded.zip, lat = excluded.lat, lon = excluded.lon`,
+				` ON CONFLICT(full_name, from_hn, to_hn, side, zip) DO UPDATE SET
+					parity = excluded.parity, lat = excluded.lat, lon = excluded.lon`,
 				rows)
 		})
 
