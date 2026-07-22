@@ -257,32 +257,58 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		zipPath := filepath.Join(tigerDir, fmt.Sprintf("tl_%s_%s_addrfeat.zip", s.cfg.TIGERYear, fips))
 		extractDir := filepath.Join(tigerDir, fips)
 
-		// Download the ZIP if it doesn't exist.
-		if _, err := os.Stat(zipPath); os.IsNotExist(err) {
-			url := fmt.Sprintf("https://www2.census.gov/geo/tiger/TIGER%s/ADDRFEAT/tl_%s_%s_addrfeat.zip",
-				s.cfg.TIGERYear, s.cfg.TIGERYear, fips)
-			log.Printf("downloading TIGER/Line data from %s...", url)
-			if err := downloadFile(ctx, url, zipPath); err != nil {
-				log.Printf("failed to download TIGER data for county %s: %v", fips, err)
-				continue // Skip failed counties instead of aborting the entire import.
+		// Import the county, retrying once with a fresh download if the local
+		// files are corrupt (e.g. a truncated ZIP from a previously interrupted
+		// download). Corrupt files are deleted, so a failed county also
+		// self-heals on the next startup instead of being skipped forever.
+		const maxCountyAttempts = 2
+		processed := false
+		for attempt := 1; attempt <= maxCountyAttempts && !processed; attempt++ {
+			// Download the ZIP if it doesn't exist.
+			if _, err := os.Stat(zipPath); os.IsNotExist(err) {
+				url := fmt.Sprintf("https://www2.census.gov/geo/tiger/TIGER%s/ADDRFEAT/tl_%s_%s_addrfeat.zip",
+					s.cfg.TIGERYear, s.cfg.TIGERYear, fips)
+				log.Printf("downloading TIGER/Line data from %s...", url)
+				if err := downloadFile(ctx, url, zipPath); err != nil {
+					log.Printf("failed to download TIGER data for county %s: %v", fips, err)
+					break // No file to work with; retry on the next run.
+				}
+				log.Printf("TIGER/Line data downloaded for county %s", fips)
+			} else {
+				log.Printf("using existing TIGER/Line data for county %s", fips)
 			}
-			log.Printf("TIGER/Line data downloaded for county %s", fips)
-		} else {
-			log.Printf("using existing TIGER/Line data for county %s", fips)
-		}
 
-		// Extract the ZIP if the directory doesn't exist.
-		if _, err := os.Stat(extractDir); os.IsNotExist(err) {
-			if err := unzipFile(zipPath, extractDir); err != nil {
-				log.Printf("failed to unzip TIGER data for county %s: %v", fips, err)
+			// Extract the ZIP if the directory doesn't exist.
+			if _, err := os.Stat(extractDir); os.IsNotExist(err) {
+				if err := unzipFile(zipPath, extractDir); err != nil {
+					log.Printf("failed to unzip TIGER data for county %s (attempt %d/%d): %v", fips, attempt, maxCountyAttempts, err)
+					removeCountyFiles(zipPath, extractDir)
+					continue
+				}
+			}
+
+			// Parse and import the shapefile. A directory with no shapefile
+			// (partial extraction) yields 0 rows and is treated as corrupt.
+			parser := tiger.NewParser(s.geo, s.cfg.ImportBatchSize)
+			count, err := parser.ParseDir(ctx, extractDir)
+			if err != nil {
+				log.Printf("failed to parse TIGER data for county %s (attempt %d/%d): %v", fips, attempt, maxCountyAttempts, err)
+				removeCountyFiles(zipPath, extractDir)
 				continue
 			}
+			if count == 0 && attempt < maxCountyAttempts {
+				log.Printf("no address ranges found for county %s (attempt %d/%d); re-downloading in case the files are corrupt", fips, attempt, maxCountyAttempts)
+				removeCountyFiles(zipPath, extractDir)
+				continue
+			}
+			if count == 0 {
+				log.Printf("warning: no address ranges found for county %s after %d attempts; marking it done anyway to avoid re-downloading every run", fips, maxCountyAttempts)
+			}
+			processed = true
 		}
 
-		// Parse and import the shapefile.
-		parser := tiger.NewParser(s.geo, s.cfg.ImportBatchSize)
-		if err := parser.ParseDir(ctx, extractDir); err != nil {
-			log.Printf("failed to parse TIGER data for county %s: %v", fips, err)
+		if !processed {
+			log.Printf("skipping county %s for now; it will be retried on the next run", fips)
 			continue
 		}
 
@@ -295,12 +321,7 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		// which does not fit on small VPS disks. The county marker above means
 		// the files are not needed again.
 		if !s.cfg.TIGERKeepData {
-			if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
-				log.Printf("warning: failed to delete %s: %v", zipPath, err)
-			}
-			if err := os.RemoveAll(extractDir); err != nil {
-				log.Printf("warning: failed to delete %s: %v", extractDir, err)
-			}
+			removeCountyFiles(zipPath, extractDir)
 		}
 	}
 
@@ -438,6 +459,15 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 
 	parser := NewParser(s.geo, s.cfg.ImportBatchSize, s.cfg.OSMDecoderWorkers)
 	if err := parser.Parse(ctx, f); err != nil {
+		// Delete the extract so the next startup downloads a fresh copy
+		// instead of failing on the same corrupt file forever (e.g. a
+		// truncated download left behind by an interrupted earlier run).
+		f.Close()
+		if rmErr := os.Remove(path); rmErr != nil {
+			log.Printf("warning: failed to delete %s after parse failure: %v", path, rmErr)
+		} else {
+			log.Printf("deleted %s after parse failure; it will be re-downloaded on the next run", path)
+		}
 		return fmt.Errorf("failed to parse osm data: %w", err)
 	}
 	f.Close() // Close early so the file can be deleted below if needed.
@@ -468,6 +498,17 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 
 // tigerCountyZipPattern matches downloaded county archives, e.g. tl_2025_25017_addrfeat.zip.
 var tigerCountyZipPattern = regexp.MustCompile(`^tl_\d{4}_(\d{5})_addrfeat\.zip$`)
+
+// removeCountyFiles deletes a county's downloaded ZIP and extracted directory,
+// e.g. after a failed unzip/parse so the next attempt downloads a fresh copy.
+func removeCountyFiles(zipPath, extractDir string) {
+	if err := os.Remove(zipPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("warning: failed to delete %s: %v", zipPath, err)
+	}
+	if err := os.RemoveAll(extractDir); err != nil {
+		log.Printf("warning: failed to delete %s: %v", extractDir, err)
+	}
+}
 
 // cleanupTigerData deletes TIGER ZIPs and extracted directories for counties
 // that are already marked as imported. Older versions kept these files

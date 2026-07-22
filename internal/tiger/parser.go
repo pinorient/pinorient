@@ -30,10 +30,14 @@ func NewParser(geo *geocoder.Geocoder, batchSize int) *Parser {
 	return &Parser{geo: geo, batchSize: batchSize}
 }
 
-func (p *Parser) ParseDir(ctx context.Context, dir string) error {
+// ParseDir imports all shapefiles in dir and returns the number of imported
+// address ranges. A directory containing no .shp file (e.g. a partial/corrupt
+// ZIP extraction) returns 0 with no error — callers must treat 0 as suspicious
+// rather than marking the county done.
+func (p *Parser) ParseDir(ctx context.Context, dir string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("failed to read tiger directory: %w", err)
+		return 0, fmt.Errorf("failed to read tiger directory: %w", err)
 	}
 
 	startTime := time.Now()
@@ -41,7 +45,7 @@ func (p *Parser) ParseDir(ctx context.Context, dir string) error {
 
 	for _, entry := range entries {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return totalImported, ctx.Err()
 		}
 		if !strings.HasSuffix(entry.Name(), ".shp") {
 			continue
@@ -52,7 +56,7 @@ func (p *Parser) ParseDir(ctx context.Context, dir string) error {
 
 		count, err := p.parseFile(ctx, shpPath)
 		if err != nil {
-			return fmt.Errorf("failed to parse %s: %w", entry.Name(), err)
+			return totalImported, fmt.Errorf("failed to parse %s: %w", entry.Name(), err)
 		}
 
 		totalImported += count
@@ -62,7 +66,7 @@ func (p *Parser) ParseDir(ctx context.Context, dir string) error {
 
 	log.Printf("tiger import complete: total=%d elapsed=%s",
 		totalImported, time.Since(startTime).Round(time.Second))
-	return nil
+	return totalImported, nil
 }
 
 func (p *Parser) parseFile(ctx context.Context, shpPath string) (int, error) {
