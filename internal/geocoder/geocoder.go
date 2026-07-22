@@ -1050,12 +1050,46 @@ func (g *Geocoder) IsTigerCountyImported(ctx context.Context, fips string) (bool
 	if err != nil {
 		return false, err
 	}
-	return v == "done", nil
+	// Accept legacy "done" markers as well as "done:<rows>" ones.
+	return v == "done" || strings.HasPrefix(v, "done:"), nil
 }
 
-// MarkTigerCountyImported marks a county as imported in the _import_state table.
-func (g *Geocoder) MarkTigerCountyImported(ctx context.Context, fips string) error {
-	return g.SetImportState(ctx, "tiger_county_"+fips, "done")
+// MarkTigerCountyImported marks a county as imported in the _import_state
+// table, recording how many address ranges were imported. The count makes
+// silently-empty imports visible (done:0) in the startup marker review and
+// in SQL reviews.
+func (g *Geocoder) MarkTigerCountyImported(ctx context.Context, fips string, rows int) error {
+	return g.SetImportState(ctx, "tiger_county_"+fips, fmt.Sprintf("done:%d", rows))
+}
+
+// ReviewTigerMarkers returns counties whose TIGER import markers look
+// suspicious: legacy "done" markers without a recorded row count (their
+// completeness can't be verified), and "done:0" markers (the import completed
+// but recorded no address ranges — worth re-checking if addresses are missing
+// in that county).
+func (g *Geocoder) ReviewTigerMarkers(ctx context.Context) (legacy, zero []string, err error) {
+	db := g.app.DB()
+	if db == nil {
+		return nil, nil, fmt.Errorf("db is not available")
+	}
+
+	var rows []struct {
+		Key   string `db:"key"`
+		Value string `db:"value"`
+	}
+	if err := db.NewQuery("SELECT key, value FROM _import_state WHERE key LIKE 'tiger_county_%'").All(&rows); err != nil {
+		return nil, nil, fmt.Errorf("failed to read tiger import markers: %w", err)
+	}
+
+	for _, r := range rows {
+		switch r.Value {
+		case "done":
+			legacy = append(legacy, strings.TrimPrefix(r.Key, "tiger_county_"))
+		case "done:0":
+			zero = append(zero, strings.TrimPrefix(r.Key, "tiger_county_"))
+		}
+	}
+	return legacy, zero, nil
 }
 
 // ClearTigerImportState removes all TIGER progress markers (per-county markers

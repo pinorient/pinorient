@@ -229,6 +229,22 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		s.cleanupTigerData(ctx, tigerDir)
 	}
 
+	// Surface suspicious markers: counties that completed with 0 rows
+	// imported, and legacy markers without a recorded row count (whose
+	// completeness can't be verified).
+	legacy, zero, err := s.geo.ReviewTigerMarkers(ctx)
+	if err != nil {
+		log.Printf("warning: failed to review TIGER import markers: %v", err)
+	} else {
+		if len(zero) > 0 {
+			log.Printf("warning: %d counties are marked done with 0 address ranges imported (suspect): %s — delete a county's marker from _import_state to force its re-import",
+				len(zero), strings.Join(zero, ", "))
+		}
+		if len(legacy) > 0 {
+			log.Printf("note: %d counties have legacy import markers without a row count; their completeness cannot be verified", len(legacy))
+		}
+	}
+
 	importedCount, doneCount, failedCount := 0, 0, 0
 	importedAny := false
 
@@ -315,8 +331,9 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 			importedAny = true
 		}
 
-		// Mark this county as imported so we can skip it on resume.
-		if err := s.geo.MarkTigerCountyImported(ctx, fips); err != nil {
+		// Mark this county as imported (with its row count, so silently-empty
+		// imports are visible later) so we can skip it on resume.
+		if err := s.geo.MarkTigerCountyImported(ctx, fips, importedRows); err != nil {
 			log.Printf("warning: failed to mark county %s as imported: %v", fips, err)
 		}
 
