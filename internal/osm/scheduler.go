@@ -167,21 +167,14 @@ func (s *Scheduler) ensureZipCache(ctx context.Context, app core.App) {
 	}
 }
 
-// EnsureTigerIndexed downloads and imports TIGER/Line address range data
-// for the configured counties if the tiger_addr_ranges table is empty.
+// EnsureTigerIndexed imports TIGER/Line address range data for the configured
+// counties. ImportTiger skips counties already marked as imported, so this is
+// cheap on every startup and — importantly — picks up counties that are
+// missing (e.g. from an interrupted earlier import) without a full re-import.
+// Previously this returned early whenever the table had any rows, which made
+// per-county resume markers unreachable and missing counties permanent.
 func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error {
 	if !s.cfg.TIGERAllCounties && len(s.cfg.TIGERCounties) == 0 {
-		return nil
-	}
-
-	// Check if TIGER data already exists.
-	hasTiger, err := s.geo.HasTigerAddrRanges(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to check TIGER addr ranges: %w", err)
-	}
-
-	if hasTiger && !s.cfg.TIGERForceReimport {
-		app.Logger().Info("TIGER addr ranges already populated")
 		return nil
 	}
 
@@ -193,14 +186,13 @@ func (s *Scheduler) EnsureTigerIndexed(ctx context.Context, app core.App) error 
 	}
 
 	if s.cfg.TIGERAllCounties {
-		app.Logger().Info("importing TIGER/Line address data for all US counties")
+		app.Logger().Info("checking TIGER/Line address data for all US counties")
 	} else {
-		app.Logger().Info("importing TIGER/Line address data", "counties", s.cfg.TIGERCounties)
+		app.Logger().Info("checking TIGER/Line address data", "counties", s.cfg.TIGERCounties)
 	}
 	if err := s.ImportTiger(ctx, app); err != nil {
 		return fmt.Errorf("TIGER import failed: %w", err)
 	}
-	app.Logger().Info("TIGER/Line import complete")
 	return nil
 }
 
@@ -237,6 +229,9 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		s.cleanupTigerData(ctx, tigerDir)
 	}
 
+	importedCount, doneCount, failedCount := 0, 0, 0
+	importedAny := false
+
 	for idx, fips := range counties {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -249,6 +244,7 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		if err != nil {
 			log.Printf("warning: failed to check import state for county %s: %v", fips, err)
 		} else if alreadyDone {
+			doneCount++
 			continue
 		}
 
@@ -263,6 +259,7 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		// self-heals on the next startup instead of being skipped forever.
 		const maxCountyAttempts = 2
 		processed := false
+		importedRows := 0
 		for attempt := 1; attempt <= maxCountyAttempts && !processed; attempt++ {
 			// Download the ZIP if it doesn't exist.
 			if _, err := os.Stat(zipPath); os.IsNotExist(err) {
@@ -304,12 +301,18 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 			if count == 0 {
 				log.Printf("warning: no address ranges found for county %s after %d attempts; marking it done anyway to avoid re-downloading every run", fips, maxCountyAttempts)
 			}
+			importedRows = count
 			processed = true
 		}
 
 		if !processed {
+			failedCount++
 			log.Printf("skipping county %s for now; it will be retried on the next run", fips)
 			continue
+		}
+		importedCount++
+		if importedRows > 0 {
+			importedAny = true
 		}
 
 		// Mark this county as imported so we can skip it on resume.
@@ -325,9 +328,20 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		}
 	}
 
-	// Rebuild the TIGER FTS index after import (chunked + resumable). Skip if
-	// it already completed and no resume is pending (e.g. on restart when all
-	// counties were already imported).
+	log.Printf("TIGER county check complete: %d imported, %d already done, %d failed",
+		importedCount, doneCount, failedCount)
+
+	// When new rows were added, the TIGER FTS index is stale: clear the done
+	// marker so it gets rebuilt below and the new rows become searchable.
+	if importedAny {
+		if err := s.geo.DeleteImportState(ctx, geocoder.StateTigerFTSDone); err != nil {
+			log.Printf("warning: failed to clear TIGER FTS state: %v", err)
+		}
+	}
+
+	// Rebuild the TIGER FTS index if needed (chunked + resumable). On
+	// steady-state startups (nothing imported, rebuild already complete, no
+	// resume pending) this is skipped entirely.
 	ftsDone, _ := s.geo.GetImportState(ctx, geocoder.StateTigerFTSDone)
 	ftsOffset, _ := s.geo.GetImportState(ctx, geocoder.StateTigerFTSOffset)
 	if ftsDone != "done" || ftsOffset != "" {
@@ -336,14 +350,16 @@ func (s *Scheduler) ImportTiger(ctx context.Context, app core.App) error {
 		}
 	}
 
-	// Flush the WAL back into the main DB file to reclaim disk space.
-	s.geo.Checkpoint(ctx)
+	if importedAny {
+		// Flush the WAL back into the main DB file to reclaim disk space.
+		s.geo.Checkpoint(ctx)
 
-	// Rebuild the ZIP cache since TIGER lookups depend on it. Skip if there
-	// is no OSM data yet (the OSM side rebuilds it once places exist).
-	if hasPlaces, err := s.geo.HasPlaces(ctx); err == nil && hasPlaces {
-		if err := s.geo.RebuildZipCache(ctx); err != nil {
-			app.Logger().Warn("failed to rebuild zip cache", "error", err)
+		// Rebuild the ZIP cache since TIGER lookups depend on it. Skip if there
+		// is no OSM data yet (the OSM side rebuilds it once places exist).
+		if hasPlaces, err := s.geo.HasPlaces(ctx); err == nil && hasPlaces {
+			if err := s.geo.RebuildZipCache(ctx); err != nil {
+				app.Logger().Warn("failed to rebuild zip cache", "error", err)
+			}
 		}
 	}
 
