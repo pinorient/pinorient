@@ -12,7 +12,7 @@ import (
 
 	"github.com/jonas-p/go-shp"
 
-	"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/pinorient/pinorient/internal/geocoder"
 )
 
 const defaultBatchSize = 2000

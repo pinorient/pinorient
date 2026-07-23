@@ -14,8 +14,8 @@ import (
 	"github.com/pocketbase/dbx"
 	"github.com/pocketbase/pocketbase/core"
 
-	"github.com/sellography/geocoder-pb/internal/config"
-	"github.com/sellography/geocoder-pb/internal/models"
+	"github.com/pinorient/pinorient/internal/config"
+	"github.com/pinorient/pinorient/internal/models"
 )
 
 // BBox represents a geographic bounding box for filtering search results.

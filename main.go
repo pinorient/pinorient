@@ -13,11 +13,11 @@ import (
 	"github.com/pocketbase/pocketbase"
 	"github.com/pocketbase/pocketbase/core"
 
-	"github.com/sellography/geocoder-pb/internal/api"
-	"github.com/sellography/geocoder-pb/internal/config"
-	"github.com/sellography/geocoder-pb/internal/db"
-	"github.com/sellography/geocoder-pb/internal/geocoder"
-	"github.com/sellography/geocoder-pb/internal/osm"
+	"github.com/pinorient/pinorient/internal/api"
+	"github.com/pinorient/pinorient/internal/config"
+	"github.com/pinorient/pinorient/internal/db"
+	"github.com/pinorient/pinorient/internal/geocoder"
+	"github.com/pinorient/pinorient/internal/osm"
 )
 
 func getEnvInt(key string, fallback int) int {

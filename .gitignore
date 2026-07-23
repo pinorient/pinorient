@@ -1,5 +1,5 @@
 # Binaries
-geocoder-pb
+pinorient
 *.exe
 *.dll
 *.so
@@ -36,4 +36,4 @@ pb_data/
 # OS files
 .DS_Store
 Thumbs.db
-cmd/geocoder
+cmd/pinorient/pinorient

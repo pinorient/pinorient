@@ -11,8 +11,8 @@ import (
 
 	"github.com/qedus/osmpbf"
 
-	"github.com/sellography/geocoder-pb/internal/geocoder"
-	"github.com/sellography/geocoder-pb/internal/models"
+	"github.com/pinorient/pinorient/internal/geocoder"
+	"github.com/pinorient/pinorient/internal/models"
 )
 
 // defaultBatchSize is the fallback batch size if none is configured.

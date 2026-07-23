@@ -8,8 +8,8 @@ import (
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketbase/pocketbase/tools/router"
 
-	"github.com/sellography/geocoder-pb/internal/config"
-	"github.com/sellography/geocoder-pb/internal/geocoder"
+	"github.com/pinorient/pinorient/internal/config"
+	"github.com/pinorient/pinorient/internal/geocoder"
 )
 
 // RegisterRoutes wires up the geocoder API routes and domain restriction middleware.

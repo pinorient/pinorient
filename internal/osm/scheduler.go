@@ -17,9 +17,9 @@ import (
 	"github.com/jonas-p/go-shp"
 	"github.com/pocketbase/pocketbase/core"
 
-	"github.com/sellography/geocoder-pb/internal/config"
-	"github.com/sellography/geocoder-pb/internal/geocoder"
-	"github.com/sellography/geocoder-pb/internal/tiger"
+	"github.com/pinorient/pinorient/internal/config"
+	"github.com/pinorient/pinorient/internal/geocoder"
+	"github.com/pinorient/pinorient/internal/tiger"
 )
 
 // Scheduler handles periodic OSM data refresh.

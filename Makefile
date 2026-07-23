@@ -1,6 +1,6 @@
 .PHONY: build run test clean tidy
 
-APP_NAME := geocoder-pb
+APP_NAME := pinorient
 
 build:
 	go build -o $(APP_NAME) ./cmd/$(APP_NAME)

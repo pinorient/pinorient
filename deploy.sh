@@ -4,6 +4,7 @@
 REMOTE_HOST="root@pinorient.com"
 REMOTE_PATH="/root/pinorient/pinorient"  # Where the binary lives on the server
 SERVICE_NAME="pinorient.service"  # Your systemd service file name
+BINARY_NAME="pinorient"  # Built binary name (matches Makefile APP_NAME)
 
 # Flags (defaults)
 DO_CIM=false
@@ -37,7 +38,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Deploy binary
-rsync -azP -e ssh "./geocoder-pb" "$REMOTE_HOST:$REMOTE_PATH"
+rsync -azP -e ssh "./$BINARY_NAME" "$REMOTE_HOST:$REMOTE_PATH"
 if [ $? -ne 0 ]; then
     echo "Rsync failed!"
     exit 1
@@ -54,11 +55,11 @@ ssh -T "$REMOTE_HOST" << EOF
     # Conditional imports (flags expanded from local env)
     if [ "$DO_CIM" = true ]; then
         echo 'Running collections import...'
-        cd $REMOTE_PATH && echo "y" | ./$INSTANCE import collections
+        cd $REMOTE_PATH && echo "y" | ./$BINARY_NAME import collections
     fi
     if [ "$DO_RIM" = true ]; then
         echo 'Running records import...'
-        cd $REMOTE_PATH && echo "y" | ./$INSTANCE import records
+        cd $REMOTE_PATH && echo "y" | ./$BINARY_NAME import records
     fi
 EOF
 if [ $? -ne 0 ]; then

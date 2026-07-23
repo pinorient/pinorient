@@ -1,10 +1,10 @@
-# geocoder-pb
+# pinorient
 
 A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and OpenStreetMap (OSM) data.
 
 ## Overview
 
-`geocoder-pb` translates written addresses into map coordinates using OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is designed as a lightweight, self-hosted alternative to the Photon API, avoiding the overhead of Java, Elasticsearch, and Docker orchestration.
+`pinorient` translates written addresses into map coordinates using OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is designed as a lightweight, self-hosted alternative to the Photon API, avoiding the overhead of Java, Elasticsearch, and Docker orchestration.
 
 ## Features
 
@@ -24,7 +24,7 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 
 ```
 .
-├── cmd/geocoder-pb/        # Application entrypoint
+├── cmd/pinorient/        # Application entrypoint
 ├── internal/
 │   ├── api/                # HTTP routes and middleware
 │   ├── config/             # Environment-based configuration
@@ -40,7 +40,7 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 
 ## Configuration
 
-Configuration is read from environment variables. A `.env` file is **optional** — if present, it is loaded automatically (via `godotenv`), but all settings have sensible defaults and the app will start and auto-download data without any configuration file. This means you can deploy the binary to a server and simply run `./geocoder-pb serve` with no `.env` file or environment variables set.
+Configuration is read from environment variables. A `.env` file is **optional** — if present, it is loaded automatically (via `godotenv`), but all settings have sensible defaults and the app will start and auto-download data without any configuration file. This means you can deploy the binary to a server and simply run `./pinorient serve` with no `.env` file or environment variables set.
 
 > **Note:** On a public-facing deployment, you may see 404 requests in the logs for paths like `/.env`, `/config.js`, `/api/config`, etc. These are automated scanners probing for exposed secrets. The server correctly returns 404 for all of them — no sensitive files are served.
 
@@ -100,7 +100,7 @@ Recovery is automatic. The app records import progress in the `_import_state` ta
 To force a clean full re-import anyway (e.g. after a schema change):
 
 ```bash
-FORCE_REINDEX=true ./geocoder-pb serve
+FORCE_REINDEX=true ./pinorient serve
 ```
 
 This re-imports all OSM data from the downloaded PBF file (existing rows are updated in place via upserts).
@@ -114,7 +114,7 @@ The importer uses batched transactions with multi-row INSERT statements (2,000 r
 To view and manage geocoder data from the PocketBase admin UI:
 
 ```bash
-./geocoder-pb superuser upsert admin@example.com password
+./pinorient superuser upsert admin@example.com password
 ```
 
 Then navigate to `http://127.0.0.1:8090/_/` and log in. The `geocoder_places` collection will appear in the collections list, where you can browse, search, and manage records.
@@ -126,7 +126,7 @@ Then navigate to `http://127.0.0.1:8090/_/` and log in. The `geocoder_places` co
 go build .
 
 # Run
-./geocoder-pb serve
+./pinorient serve
 ```
 
 ### API Endpoints
@@ -278,11 +278,11 @@ Each result in the `results` array contains:
 
 ## Comparison with Komoot Photon
 
-[Photon](https://photon.komoot.io/) is a popular open-source geocoder built on Elasticsearch with OSM data. `geocoder-pb` was designed as a lightweight, self-hosted alternative to Photon, but it is **not a drop-in replacement** — the API response format differs.
+[Photon](https://photon.komoot.io/) is a popular open-source geocoder built on Elasticsearch with OSM data. `pinorient` was designed as a lightweight, self-hosted alternative to Photon, but it is **not a drop-in replacement** — the API response format differs.
 
 ### Key Differences
 
-| Feature | Photon | geocoder-pb |
+| Feature | Photon | pinorient |
 |---------|--------|-------------|
 | **Response format** | GeoJSON `FeatureCollection` | Simple JSON `{ query, results: [...] }` |
 | **Coordinates** | `geometry.coordinates: [lon, lat]` (GeoJSON order) | Separate `lat` and `lon` fields |
@@ -337,7 +337,7 @@ If you're replacing a Photon deployment, you'll need to adapt your client code t
 
 ## TIGER/Line Address Interpolation
 
-In addition to OSM data, `geocoder-pb` imports [TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) ADDRFEAT address range data from the US Census Bureau. This fills coverage gaps for addresses that exist in TIGER but not in OSM (e.g., house-numbered streets without address nodes in OSM).
+In addition to OSM data, `pinorient` imports [TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) ADDRFEAT address range data from the US Census Bureau. This fills coverage gaps for addresses that exist in TIGER but not in OSM (e.g., house-numbered streets without address nodes in OSM).
 
 When a search or autocomplete query starts with a house number (e.g., `42 Maple Street`), the geocoder looks up matching TIGER address ranges and interpolates the coordinates. City and state names are enriched from OSM data using the ZIP code, since TIGER ADDRFEAT only contains ZIP codes.
 
@@ -365,13 +365,13 @@ To limit the import to specific counties, set `TIGER_ALL_COUNTIES=false` and spe
 
 ```bash
 # Import only Middlesex County, MA (Cambridge area)
-TIGER_ALL_COUNTIES=false TIGER_COUNTIES=25017 ./geocoder-pb serve
+TIGER_ALL_COUNTIES=false TIGER_COUNTIES=25017 ./pinorient serve
 ```
 
 To force a re-import of TIGER data (e.g., after upgrading to a new year):
 
 ```bash
-TIGER_FORCE_REIMPORT=1 ./geocoder-pb serve
+TIGER_FORCE_REIMPORT=1 ./pinorient serve
 ```
 
 ### Verifying the Import
@@ -401,7 +401,7 @@ sqlite3 pb_data/data.db "SELECT * FROM tiger_addr_ranges WHERE full_name = 'Birc
 Set `UPDATE_CRON` to a valid cron expression to automatically download and re-index OSM data on a schedule. For example:
 
 ```bash
-UPDATE_CRON="0 3 * * 0" ./geocoder-pb serve
+UPDATE_CRON="0 3 * * 0" ./pinorient serve
 ```
 
 ## License

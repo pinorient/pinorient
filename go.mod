@@ -1,4 +1,4 @@
-module github.com/sellography/geocoder-pb
+module github.com/pinorient/pinorient
 
 go 1.25.0
 
