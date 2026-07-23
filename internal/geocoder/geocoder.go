@@ -224,6 +224,7 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		places = places[:limit]
 	}
 
+	g.enrichFromZipCache(ctx, places)
 	return places, nil
 }
 
@@ -300,6 +301,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		places = places[:limit]
 	}
 
+	g.enrichFromZipCache(ctx, places)
 	return places, nil
 }
 
@@ -373,7 +375,75 @@ func (g *Geocoder) Reverse(ctx context.Context, lat, lon float64, limit int) ([]
 		return nil, fmt.Errorf("reverse geocoding failed: %w", err)
 	}
 
+	g.enrichFromZipCache(ctx, places)
 	return places, nil
+}
+
+// enrichFromZipCache fills empty City/State fields on search results from the
+// zip_city_state cache (derived from OSM data). OSM addresses frequently lack
+// addr:city/addr:state tags even when addr:postcode is present. Existing
+// values are never overwritten. Uses a single batched lookup (no N+1).
+func (g *Geocoder) enrichFromZipCache(ctx context.Context, places []models.Place) {
+	seen := make(map[string]bool)
+	var zips []string
+	for i := range places {
+		p := &places[i]
+		if (p.City == "" || p.State == "") && p.Postcode != "" && !seen[p.Postcode] {
+			seen[p.Postcode] = true
+			zips = append(zips, p.Postcode)
+		}
+	}
+	if len(zips) == 0 {
+		return
+	}
+
+	db := g.app.DB()
+	if db == nil {
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT postcode, COALESCE(city, '') AS city, COALESCE(state, '') AS state FROM zip_city_state WHERE postcode IN (")
+	params := dbx.Params{}
+	for i, z := range zips {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		key := fmt.Sprintf("z%d", i)
+		sb.WriteString("{:" + key + "}")
+		params[key] = z
+	}
+	sb.WriteByte(')')
+
+	var rows []struct {
+		Postcode string `db:"postcode"`
+		City     string `db:"city"`
+		State    string `db:"state"`
+	}
+	if err := db.NewQuery(sb.String()).Bind(params).All(&rows); err != nil {
+		g.app.Logger().Warn("zip cache enrichment failed", "error", err)
+		return
+	}
+
+	type cityState struct{ city, state string }
+	byZip := make(map[string]cityState, len(rows))
+	for _, r := range rows {
+		byZip[r.Postcode] = cityState{city: r.City, state: r.State}
+	}
+
+	for i := range places {
+		p := &places[i]
+		cs, ok := byZip[p.Postcode]
+		if !ok {
+			continue
+		}
+		if p.City == "" {
+			p.City = cs.city
+		}
+		if p.State == "" {
+			p.State = cs.state
+		}
+	}
 }
 
 // UpsertPlace inserts or updates a single place in the geocoder index.
