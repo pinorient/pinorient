@@ -44,6 +44,9 @@ type Geocoder struct {
 	// correctness). Bounded by termCountsCacheCap.
 	termCounts   map[string]int64
 	termCountsMu sync.RWMutex
+	// vocabBroken is set when the fts5vocab statistics table is missing, in
+	// which case probing stops and all terms report termCountUnknown.
+	vocabBroken bool
 }
 
 // New creates a new Geocoder instance.
@@ -211,21 +214,21 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 	// ("street", "center") can take seconds on the full dataset.
 	const orderBy = "bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)"
 	tokens := ftsTokens(q)
-	counts, countsErr := g.cachedTermDocCounts(ctx, tokens)
+	counts := g.cachedTermDocCounts(ctx, tokens)
 
 	// The raw query as a phrase match (all tokens adjacent, in order) is the
 	// highest-precision interpretation. Run it only when estimated cheap.
 	var osmPlaces []models.Place
 	var err error
-	if countsErr != nil || len(tokens) < 2 || minEffectiveCount(tokens, counts, false) <= phraseMinDocBudget {
+	if len(tokens) < 2 || minEffectiveCount(tokens, counts, false) <= phraseMinDocBudget {
 		osmPlaces, err = g.ftsPlaces(ctx, q, limit, bbox, orderBy)
 		if err != nil {
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
 	}
 	if len(osmPlaces) == 0 {
-		andOK := countsErr != nil || minEffectiveCount(tokens, counts, false) <= andMinDocBudget
-		osmPlaces, err = g.fallbackPartialMatch(ctx, tokens, counts, countsErr, limit, bbox, orderBy, false, andOK)
+		andOK := minEffectiveCount(tokens, counts, false) <= andMinDocBudget
+		osmPlaces, err = g.fallbackPartialMatch(ctx, tokens, counts, limit, bbox, orderBy, false, andOK)
 		if err != nil {
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
@@ -257,8 +260,8 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 	// Cost-aware planning as in Search: run the strict prefix AND only when
 	// the rarest token's doclist is small enough to intersect cheaply.
 	tokens := ftsTokens(q)
-	counts, countsErr := g.cachedTermDocCounts(ctx, tokens)
-	andOK := countsErr != nil || len(tokens) < 2 || minEffectiveCount(tokens, counts, true) <= andMinDocBudget
+	counts := g.cachedTermDocCounts(ctx, tokens)
+	andOK := len(tokens) < 2 || minEffectiveCount(tokens, counts, true) <= andMinDocBudget
 
 	var places []models.Place
 	var err error
@@ -277,7 +280,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		// The strict all-token prefix query matched nothing (e.g. an
 		// institution + building name spanning multiple OSM features) or was
 		// estimated too expensive. Fall back to the anchored partial match.
-		places, err = g.fallbackPartialMatch(ctx, tokens, counts, countsErr, limit, bbox,
+		places, err = g.fallbackPartialMatch(ctx, tokens, counts, limit, bbox,
 			"bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)", true, false)
 		if err != nil {
 			return nil, fmt.Errorf("autocomplete failed: %w", err)
@@ -396,6 +399,17 @@ const (
 	// is reset wholesale (counts are only estimates; a reset just means a few
 	// extra vocab lookups).
 	termCountsCacheCap = 50000
+	// termCountProbeTimeout bounds a single term's document-count probe. The
+	// fts5vocab doc count scans the term's whole doclist, which for
+	// mega-common terms ("street", house numbers) can take seconds on a small
+	// server — far too long to block a request on.
+	termCountProbeTimeout = 250 * time.Millisecond
+	// termCountUnknown is the sentinel document count used when a term's true
+	// count is unavailable (probe timeout, or the vocab table missing
+	// entirely). Treating unknown terms as mega-common is the safe direction:
+	// every planner gate then routes to the cheapest query shape. Only used
+	// for cost estimation, never for correctness decisions.
+	termCountUnknown = int64(1) << 40
 )
 
 // ftsPlaces runs a single FTS5 query against geocoder_places_fts and returns
@@ -465,13 +479,10 @@ func (g *Geocoder) ftsPlaces(ctx context.Context, ftsQuery string, limit int, bb
 //     preferMultiTokenMatches ranks rows matching several tokens ahead of
 //     single-token noise.
 //
-// prefixLast enables autocomplete-style prefix matching on the final token
-// (only for the legacy unanchored path; anchored candidates rely on the
-// substring-aware token-hit preference instead). andBudgetOK reports whether
-// the caller's cost estimate allows the exact-token AND tier. countsErr
-// indicates the document-count lookup failed; the function then degrades to
-// the legacy unanchored OR rather than failing the request.
-func (g *Geocoder) fallbackPartialMatch(ctx context.Context, tokens []string, counts map[string]int64, countsErr error, limit int, bbox *BBox, orderBy string, prefixLast, andBudgetOK bool) ([]models.Place, error) {
+// prefixLast enables autocomplete-style prefix matching on the final token.
+// andBudgetOK reports whether the caller's cost estimate allows the
+// exact-token AND tier.
+func (g *Geocoder) fallbackPartialMatch(ctx context.Context, tokens []string, counts map[string]int64, limit int, bbox *BBox, orderBy string, prefixLast, andBudgetOK bool) ([]models.Place, error) {
 	if len(tokens) < 2 || len(tokens) > maxFallbackTokens {
 		// A single token gains nothing from an OR (identical to the AND),
 		// and very long queries make the OR too broad to be meaningful.
@@ -490,15 +501,8 @@ func (g *Geocoder) fallbackPartialMatch(ctx context.Context, tokens []string, co
 		}
 	}
 
-	if countsErr != nil {
-		// Degrade to the legacy unanchored OR rather than failing the
-		// request (e.g. on a SQLite build without fts5vocab).
-		log.Printf("warning: term doc counts unavailable (%v); using unanchored OR fallback", countsErr)
-		return g.orCandidates(ctx, buildOrQuery(tokens, prefixLast), orderBy, tokens, limit, bbox)
-	}
-
 	// Anchor the candidate query on the rarest tokens using the FTS index's
-	// own per-term document counts (fast index lookups via fts5vocab).
+	// own per-term document counts (fast index probes via fts5vocab).
 	anchors, useAND := pickAnchorTokens(tokens, counts)
 
 	var candQuery, candOrderBy string
@@ -544,125 +548,121 @@ func (g *Geocoder) orCandidates(ctx context.Context, candQuery, candOrderBy stri
 	return preferMultiTokenMatches(candidates, tokens, limit), nil
 }
 
-// termDocCounts returns the number of documents containing each token
-// (case-insensitive) according to the FTS5 index. The fts5vocab virtual
-// table is a view over the existing index — creating it stores nothing and
-// per-term lookups are index probes, not scans. Terms absent from the index
-// are missing from the result (callers read them as 0 via the map).
-func (g *Geocoder) termDocCounts(ctx context.Context, tokens []string) (map[string]int64, error) {
-	db := g.app.DB()
-	if db == nil {
-		return nil, fmt.Errorf("db is not available")
-	}
-	if _, err := db.NewQuery(
-		`CREATE VIRTUAL TABLE IF NOT EXISTS geocoder_places_fts_vocab USING fts5vocab('geocoder_places_fts', 'row')`,
-	).Execute(); err != nil {
-		return nil, fmt.Errorf("failed to create fts vocab table: %w", err)
-	}
-
-	// Dedupe and lowercase (the FTS unicode61 tokenizer lowercases terms).
-	seen := make(map[string]bool, len(tokens))
-	terms := make([]string, 0, len(tokens))
-	for _, t := range tokens {
-		lt := strings.ToLower(t)
-		if len(lt) < 2 || seen[lt] {
-			continue
-		}
-		seen[lt] = true
-		terms = append(terms, lt)
-	}
-	counts := make(map[string]int64, len(terms))
-	if len(terms) == 0 {
-		return counts, nil
-	}
-
-	var sb strings.Builder
-	sb.WriteString("SELECT term, doc FROM geocoder_places_fts_vocab WHERE term IN (")
-	params := make(dbx.Params, len(terms))
-	for i, t := range terms {
-		if i > 0 {
-			sb.WriteByte(',')
-		}
-		key := fmt.Sprintf("t%d", i)
-		sb.WriteString("{:" + key + "}")
-		params[key] = t
-	}
-	sb.WriteByte(')')
-
-	var rows []struct {
-		Term string `db:"term"`
-		Doc  int64  `db:"doc"`
-	}
-	if err := db.NewQuery(sb.String()).Bind(params).All(&rows); err != nil {
-		return nil, fmt.Errorf("term doc count lookup failed: %w", err)
-	}
-	for _, r := range rows {
-		counts[r.Term] = r.Doc
-	}
-	return counts, nil
-}
-
-// cachedTermDocCounts returns per-term document counts like termDocCounts,
-// but memoized in the Geocoder instance. Query terms are highly repetitive
-// ("street", city names), so after warmup the vocab lookup almost never runs.
-func (g *Geocoder) cachedTermDocCounts(ctx context.Context, tokens []string) (map[string]int64, error) {
+// cachedTermDocCounts returns per-term FTS document counts, memoized in the
+// Geocoder instance. Query terms are highly repetitive ("street", city
+// names), so after warmup the vocab lookup almost never runs.
+//
+// Tokens shorter than 3 characters are never probed: they are skipped by
+// every query builder anyway, and counting them is ruinous — "rd" or "ave"
+// appear in tens of millions of documents and the vocab doc count scans the
+// whole doclist (a 20s+ stall on a small server, observed in production).
+//
+// Each miss is probed with termCountProbeTimeout; a term that times out (or
+// the whole table being unavailable) is recorded as termCountUnknown, i.e.
+// mega-common, which is the safe direction for every planner gate.
+func (g *Geocoder) cachedTermDocCounts(ctx context.Context, tokens []string) map[string]int64 {
 	counts := make(map[string]int64, len(tokens))
 	var misses []string
 
 	g.termCountsMu.RLock()
+	broken := g.vocabBroken
 	seen := make(map[string]bool, len(tokens))
 	for _, t := range tokens {
 		lt := strings.ToLower(t)
-		if seen[lt] {
+		if len(lt) < 3 || seen[lt] {
 			continue
 		}
 		seen[lt] = true
 		if c, ok := g.termCounts[lt]; ok {
 			counts[lt] = c
 		} else {
-			misses = append(misses, t)
+			misses = append(misses, lt)
 		}
 	}
 	g.termCountsMu.RUnlock()
 
-	if len(misses) > 0 {
-		fresh, err := g.termDocCounts(ctx, misses)
-		if err != nil {
-			return nil, err
+	if broken {
+		for _, lt := range misses {
+			counts[lt] = termCountUnknown
 		}
+		return counts
+	}
+
+	for _, lt := range misses {
+		probeCtx, cancel := context.WithTimeout(ctx, termCountProbeTimeout)
+		c, err := g.termDocCount(probeCtx, lt)
+		cancel()
+		if err != nil {
+			if strings.Contains(err.Error(), "no such table") {
+				// The vocab statistics table does not exist (should not
+				// happen — migrations create it at startup): stop probing
+				// and treat every term as unknown from now on.
+				g.termCountsMu.Lock()
+				if !g.vocabBroken {
+					log.Printf("warning: fts vocab table unavailable (%v); term counts disabled", err)
+					g.vocabBroken = true
+				}
+				g.termCountsMu.Unlock()
+			}
+			c = termCountUnknown
+		}
+
 		g.termCountsMu.Lock()
 		if len(g.termCounts) > termCountsCacheCap {
 			g.termCounts = make(map[string]int64, termCountsCacheCap)
 		}
-		for _, t := range misses {
-			lt := strings.ToLower(t)
-			c := fresh[lt] // 0 when absent from the index
-			g.termCounts[lt] = c
-			counts[lt] = c
-		}
+		g.termCounts[lt] = c
 		g.termCountsMu.Unlock()
+		counts[lt] = c
 	}
-	return counts, nil
+	return counts
+}
+
+// termDocCount returns the number of FTS documents containing the term (0 for
+// terms absent from the index) via the fts5vocab statistics table. The table
+// is created at startup in db.RunMigrations; creating it lazily here would
+// take the write lock inside request handling, which stalls behind imports.
+func (g *Geocoder) termDocCount(ctx context.Context, term string) (int64, error) {
+	db := g.app.DB()
+	if db == nil {
+		return 0, fmt.Errorf("db is not available")
+	}
+	var doc int64
+	err := db.NewQuery("SELECT doc FROM geocoder_places_fts_vocab WHERE term = {:term}").
+		Bind(dbx.Params{"term": term}).Row(&doc)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return doc, err
 }
 
 // minEffectiveCount returns the smallest estimated document count among the
 // tokens — the quantity that drives FTS5 intersection cost (other doclists
 // are probed from the smallest one). The final token in prefix mode is
 // weighted by prefixCostMultiplier. Terms missing from the index count as 0,
-// making strict matching trivially cheap. Pure function.
+// making strict matching trivially cheap; unknown terms count as
+// termCountUnknown, making them expensive. Tokens shorter than 3 characters
+// are skipped (every query builder skips them too). Pure function.
 func minEffectiveCount(tokens []string, counts map[string]int64, prefixLast bool) int64 {
-	if len(tokens) == 0 {
-		return 0
-	}
 	minC := int64(math.MaxInt64)
 	for i, t := range tokens {
-		c := counts[strings.ToLower(t)]
-		if prefixLast && i == len(tokens)-1 && len(t) >= 3 && len(t) <= 5 {
+		lt := strings.ToLower(t)
+		if len(lt) < 3 {
+			continue
+		}
+		c := counts[lt]
+		if prefixLast && i == len(tokens)-1 && len(t) <= 5 {
 			c *= prefixCostMultiplier
 		}
 		if c < minC {
 			minC = c
 		}
+	}
+	if minC == int64(math.MaxInt64) {
+		// No countable tokens (e.g. "15 rd"): treat as expensive so strict
+		// tiers are skipped; the anchored fallback finds nothing and the
+		// TIGER path handles these queries.
+		return termCountUnknown
 	}
 	return minC
 }

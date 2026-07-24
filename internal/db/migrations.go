@@ -83,6 +83,11 @@ func RunMigrations(app core.App) error {
 			INSERT INTO geocoder_places_fts(rowid, name, address, city, state, postcode)
 			VALUES (new.rowid, new.name, new.address, new.city, new.state, new.postcode);
 		END`,
+		// Per-term document statistics for query cost estimation (see
+		// geocoder.termDocCount). A view over the FTS index — stores nothing.
+		// Created here at startup rather than lazily in request handlers,
+		// where the write lock would stall behind import transactions.
+		`CREATE VIRTUAL TABLE IF NOT EXISTS geocoder_places_fts_vocab USING fts5vocab('geocoder_places_fts', 'row')`,
 	}
 	for _, q := range ftsQueries {
 		if _, err := db.NewQuery(q).Execute(); err != nil {

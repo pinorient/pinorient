@@ -274,8 +274,16 @@ func TestMinEffectiveCount(t *testing.T) {
 	if got := minEffectiveCount([]string{"street", "bowdoin"}, counts, true); got != 3443 {
 		t.Errorf("no prefix on long token: got %d, want 3443", got)
 	}
-	if got := minEffectiveCount(nil, counts, false); got != 0 {
-		t.Errorf("empty tokens: got %d, want 0", got)
+	// Short tokens are skipped entirely (never probed, never gate drivers).
+	if got := minEffectiveCount([]string{"rd", "roux"}, counts, false); got != 150 {
+		t.Errorf("short token skip: got %d, want 150", got)
+	}
+	// No countable tokens at all → treated as expensive (strict tiers skipped).
+	if got := minEffectiveCount([]string{"15", "rd"}, counts, false); got != termCountUnknown {
+		t.Errorf("all-short tokens: got %d, want termCountUnknown", got)
+	}
+	if got := minEffectiveCount(nil, counts, false); got != termCountUnknown {
+		t.Errorf("empty tokens: got %d, want termCountUnknown", got)
 	}
 }
 
