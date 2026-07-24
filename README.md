@@ -148,11 +148,14 @@ All endpoints are under `/api/geocoder/` and return JSON with a `results` array 
 
 Full-text search for places and addresses.
 
-Matching is tiered: the strict interpretation of the query runs first (all
-tokens in one record), and only when that returns nothing does a **ranked
-partial match** kick in — the same approach Photon uses. This is what makes
-institution-style queries work, where the place named spans multiple OSM
-features:
+Matching is tiered and **cost-aware**: the strict interpretation of the query
+runs first when it is estimated cheap (FTS5 intersections are priced by the
+rarest token's document count, probed from the index's own statistics), and
+otherwise the planner goes straight to a **ranked partial match** anchored on
+the query's rare tokens — the same relevance approach Photon uses, without
+the multi-second scans a naive query needs for common terms like "street" or
+"center". This is what makes institution-style queries work, where the place
+named spans multiple OSM features:
 
 ```bash
 # "Bowdoin College" (a campus) and "Roux Center for the Environment" (a

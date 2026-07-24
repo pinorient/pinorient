@@ -7,8 +7,10 @@ import (
 	"log"
 	"log/slog"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pocketbase/dbx"
@@ -36,11 +38,17 @@ func (b *BBox) Valid() bool {
 type Geocoder struct {
 	app core.App
 	cfg *config.Config
+
+	// termCounts caches per-term FTS document counts (used only for query
+	// cost estimation — a stale value just misestimates cost, never
+	// correctness). Bounded by termCountsCacheCap.
+	termCounts   map[string]int64
+	termCountsMu sync.RWMutex
 }
 
 // New creates a new Geocoder instance.
 func New(app core.App, cfg *config.Config) *Geocoder {
-	return &Geocoder{app: app, cfg: cfg}
+	return &Geocoder{app: app, cfg: cfg, termCounts: make(map[string]int64)}
 }
 
 // Import-state keys used in the _import_state table to make long-running
@@ -195,17 +203,29 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		places = append(places, tigerPlaces...)
 	}
 
-	// Use FTS5 to match the query across indexed fields. The raw query is a
-	// phrase match (all tokens adjacent, in order) — the highest-precision
-	// interpretation. When it matches nothing, progressively looser tokenized
-	// fallbacks kick in (see fallbackPartialMatch).
+	// Use FTS5 to match the query across indexed fields. The plan is
+	// cost-aware: FTS5 intersections are driven by the rarest token's doclist,
+	// so a cheap vocab count lookup tells us whether strict matching (phrase
+	// / tokenized AND) is affordable or whether to go straight to the
+	// anchored partial match. Naive strict queries over common tokens
+	// ("street", "center") can take seconds on the full dataset.
 	const orderBy = "bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)"
-	osmPlaces, err := g.ftsPlaces(ctx, q, limit, bbox, orderBy)
-	if err != nil {
-		return nil, fmt.Errorf("search failed: %w", err)
+	tokens := ftsTokens(q)
+	counts, countsErr := g.cachedTermDocCounts(ctx, tokens)
+
+	// The raw query as a phrase match (all tokens adjacent, in order) is the
+	// highest-precision interpretation. Run it only when estimated cheap.
+	var osmPlaces []models.Place
+	var err error
+	if countsErr != nil || len(tokens) < 2 || minEffectiveCount(tokens, counts, false) <= phraseMinDocBudget {
+		osmPlaces, err = g.ftsPlaces(ctx, q, limit, bbox, orderBy)
+		if err != nil {
+			return nil, fmt.Errorf("search failed: %w", err)
+		}
 	}
 	if len(osmPlaces) == 0 {
-		osmPlaces, err = g.fallbackPartialMatch(ctx, q, limit, bbox, orderBy, false)
+		andOK := countsErr != nil || minEffectiveCount(tokens, counts, false) <= andMinDocBudget
+		osmPlaces, err = g.fallbackPartialMatch(ctx, tokens, counts, countsErr, limit, bbox, orderBy, false, andOK)
 		if err != nil {
 			return nil, fmt.Errorf("search failed: %w", err)
 		}
@@ -234,22 +254,31 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		return nil, fmt.Errorf("db is not available")
 	}
 
-	// Build FTS5 prefix query: "1600 pen*" -> "1600* pen*"
-	ftsQuery := buildPrefixQuery(q)
-	if ftsQuery == "" {
-		return []models.Place{}, nil
-	}
+	// Cost-aware planning as in Search: run the strict prefix AND only when
+	// the rarest token's doclist is small enough to intersect cheaply.
+	tokens := ftsTokens(q)
+	counts, countsErr := g.cachedTermDocCounts(ctx, tokens)
+	andOK := countsErr != nil || len(tokens) < 2 || minEffectiveCount(tokens, counts, true) <= andMinDocBudget
 
-	places, err := g.ftsPlaces(ctx, ftsQuery, limit, bbox, "rank")
-	if err != nil {
-		return nil, fmt.Errorf("autocomplete failed: %w", err)
+	var places []models.Place
+	var err error
+	if andOK {
+		// Build FTS5 prefix query: "1600 pen*" -> "1600* pen*"
+		ftsQuery := buildPrefixQuery(q)
+		if ftsQuery == "" {
+			return []models.Place{}, nil
+		}
+		places, err = g.ftsPlaces(ctx, ftsQuery, limit, bbox, "rank")
+		if err != nil {
+			return nil, fmt.Errorf("autocomplete failed: %w", err)
+		}
 	}
 	if len(places) == 0 {
 		// The strict all-token prefix query matched nothing (e.g. an
-		// institution + building name spanning multiple OSM features).
-		// Fall back to a ranked partial match.
-		places, err = g.fallbackPartialMatch(ctx, q, limit, bbox,
-			"bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)", true)
+		// institution + building name spanning multiple OSM features) or was
+		// estimated too expensive. Fall back to the anchored partial match.
+		places, err = g.fallbackPartialMatch(ctx, tokens, counts, countsErr, limit, bbox,
+			"bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)", true, false)
 		if err != nil {
 			return nil, fmt.Errorf("autocomplete failed: %w", err)
 		}
@@ -329,9 +358,44 @@ const (
 	// orFetchFactor over-fetches OR-fallback candidates relative to the
 	// requested limit so the multi-token preference has rows to work with.
 	orFetchFactor = 4
-	// orFetchMin/orFetchMax bound the OR-fallback candidate fetch size.
-	orFetchMin = 20
-	orFetchMax = 100
+	// orFetchMin/orFetchMax bound the OR-fallback candidate fetch size. The
+	// pool must be large because bm25 scores candidates on the anchor terms
+	// only — the best multi-token matches can sit deep in the anchor order
+	// (e.g. a short name like "Roux" outranks "Roux Center ..." on the term
+	// "roux"). Evaluating the candidate set costs the same regardless of
+	// LIMIT, so a generous pool is nearly free.
+	orFetchMin = 200
+	orFetchMax = 500
+	// anchorANDRankBudget bounds the result-set size for which an anchored
+	// AND intersection is bm25-ranked. Ranking costs O(result set): when even
+	// the rarest anchor is huge ("main" AND "street" = ~400K rows), ranking
+	// takes seconds while an unordered LIMIT returns instantly — and for such
+	// degenerate queries any matching rows are equally (un)informative.
+	anchorANDRankBudget = 200000
+	// anchorDocThreshold bounds how many documents the anchored OR candidate
+	// query may scan. The two rarest tokens are always used; if even those
+	// exceed the threshold they are AND-ed (intersection) instead.
+	anchorDocThreshold = 100000
+	// anchorExtendBudget caps cumulative document counts when adding a 3rd
+	// or 4th anchor token: extra anchors are only worth it when every token
+	// is rare — otherwise common-token matches just dilute the candidates.
+	anchorExtendBudget = 10000
+	// phraseMinDocBudget is the maximum rarest-token document count for which
+	// a phrase query is considered cheap. Phrase matching verifies token
+	// positions across the doclist (~8x pricier per row than a plain AND):
+	// 25K docs ≈ a few hundred ms on a small server.
+	phraseMinDocBudget = 25000
+	// andMinDocBudget is the maximum rarest-token document count for which a
+	// multi-token AND is considered cheap (FTS5 intersects by probing other
+	// doclists from the smallest one).
+	andMinDocBudget = 50000
+	// prefixCostMultiplier weights an autocomplete prefix token in cost
+	// estimates: a prefix expands to several index terms.
+	prefixCostMultiplier = 5
+	// termCountsCacheCap bounds the term document-count cache. On overflow it
+	// is reset wholesale (counts are only estimates; a reset just means a few
+	// extra vocab lookups).
+	termCountsCacheCap = 50000
 )
 
 // ftsPlaces runs a single FTS5 query against geocoder_places_fts and returns
@@ -355,6 +419,14 @@ func (g *Geocoder) ftsPlaces(ctx context.Context, ftsQuery string, limit int, bb
 		params["max_lng"] = bbox.MaxLng
 	}
 
+	// An empty orderBy omits the ORDER BY entirely: FTS5 then returns rows in
+	// index order and LIMIT stops the scan early, which is what makes the
+	// unranked degenerate-query path fast.
+	orderClause := ""
+	if orderBy != "" {
+		orderClause = "ORDER BY " + orderBy
+	}
+
 	query := fmt.Sprintf(`
 		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
 		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
@@ -363,9 +435,9 @@ func (g *Geocoder) ftsPlaces(ctx context.Context, ftsQuery string, limit int, bb
 		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
 		WHERE geocoder_places_fts MATCH {:query}
 		%s
-		ORDER BY %s
+		%s
 		LIMIT {:limit}
-	`, bboxClause, orderBy)
+	`, bboxClause, orderClause)
 
 	var places []models.Place
 	if err := db.
@@ -386,20 +458,27 @@ func (g *Geocoder) ftsPlaces(ctx context.Context, ftsQuery string, limit int, bb
 //
 //  1. tokenized AND — every token must match, but in any field and any order
 //     (skipped for prefix matching, where the caller already tried an AND);
-//  2. ranked OR — bm25 naturally surfaces rows matching the rare tokens, and
-//     preferMultiTokenMatches keeps rows matching 2+ tokens ahead of
+//  2. anchored ranked OR — a plain OR of every token forces FTS5 to visit
+//     and rank millions of rows for common terms ("center", "street"), which
+//     took ~10s on the production dataset. Instead the OR is anchored on the
+//     rarest tokens (per the index's own document frequencies), and
+//     preferMultiTokenMatches ranks rows matching several tokens ahead of
 //     single-token noise.
 //
-// prefixLast enables autocomplete-style prefix matching on the final token.
-func (g *Geocoder) fallbackPartialMatch(ctx context.Context, q string, limit int, bbox *BBox, orderBy string, prefixLast bool) ([]models.Place, error) {
-	tokens := ftsTokens(q)
+// prefixLast enables autocomplete-style prefix matching on the final token
+// (only for the legacy unanchored path; anchored candidates rely on the
+// substring-aware token-hit preference instead). andBudgetOK reports whether
+// the caller's cost estimate allows the exact-token AND tier. countsErr
+// indicates the document-count lookup failed; the function then degrades to
+// the legacy unanchored OR rather than failing the request.
+func (g *Geocoder) fallbackPartialMatch(ctx context.Context, tokens []string, counts map[string]int64, countsErr error, limit int, bbox *BBox, orderBy string, prefixLast, andBudgetOK bool) ([]models.Place, error) {
 	if len(tokens) < 2 || len(tokens) > maxFallbackTokens {
 		// A single token gains nothing from an OR (identical to the AND),
 		// and very long queries make the OR too broad to be meaningful.
 		return nil, nil
 	}
 
-	if !prefixLast {
+	if !prefixLast && andBudgetOK {
 		if andQuery := buildAndQuery(tokens); andQuery != "" {
 			places, err := g.ftsPlaces(ctx, andQuery, limit, bbox, orderBy)
 			if err != nil {
@@ -411,8 +490,40 @@ func (g *Geocoder) fallbackPartialMatch(ctx context.Context, q string, limit int
 		}
 	}
 
-	orQuery := buildOrQuery(tokens, prefixLast)
-	if orQuery == "" {
+	if countsErr != nil {
+		// Degrade to the legacy unanchored OR rather than failing the
+		// request (e.g. on a SQLite build without fts5vocab).
+		log.Printf("warning: term doc counts unavailable (%v); using unanchored OR fallback", countsErr)
+		return g.orCandidates(ctx, buildOrQuery(tokens, prefixLast), orderBy, tokens, limit, bbox)
+	}
+
+	// Anchor the candidate query on the rarest tokens using the FTS index's
+	// own per-term document counts (fast index lookups via fts5vocab).
+	anchors, useAND := pickAnchorTokens(tokens, counts)
+
+	var candQuery, candOrderBy string
+	if useAND {
+		candQuery = buildAndQuery(anchors)
+		candOrderBy = orderBy
+		if minEffectiveCount(anchors, counts, false) > anchorANDRankBudget {
+			// The intersection is enormous — skip the bm25 ranking (it costs
+			// seconds) and take the first matching rows instead. Ordering by
+			// anything (even p.rowid) would force a plan scan; no ORDER BY
+			// lets FTS5 stop at LIMIT.
+			candOrderBy = ""
+		}
+	} else {
+		candQuery = buildOrQuery(anchors, false)
+		candOrderBy = orderBy
+	}
+	return g.orCandidates(ctx, candQuery, candOrderBy, tokens, limit, bbox)
+}
+
+// orCandidates fetches OR-fallback candidates and applies the multi-token
+// preference. candQuery is an FTS5 MATCH expression and candOrderBy an
+// internal ORDER BY expression, both built by the caller.
+func (g *Geocoder) orCandidates(ctx context.Context, candQuery, candOrderBy string, tokens []string, limit int, bbox *BBox) ([]models.Place, error) {
+	if candQuery == "" {
 		return nil, nil
 	}
 	fetch := limit * orFetchFactor
@@ -422,11 +533,183 @@ func (g *Geocoder) fallbackPartialMatch(ctx context.Context, q string, limit int
 	if fetch > orFetchMax {
 		fetch = orFetchMax
 	}
-	candidates, err := g.ftsPlaces(ctx, orQuery, fetch, bbox, orderBy)
+	start := time.Now()
+	candidates, err := g.ftsPlaces(ctx, candQuery, fetch, bbox, candOrderBy)
 	if err != nil {
 		return nil, err
 	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		log.Printf("slow fallback match: %q took %s", candQuery, elapsed.Round(time.Millisecond))
+	}
 	return preferMultiTokenMatches(candidates, tokens, limit), nil
+}
+
+// termDocCounts returns the number of documents containing each token
+// (case-insensitive) according to the FTS5 index. The fts5vocab virtual
+// table is a view over the existing index — creating it stores nothing and
+// per-term lookups are index probes, not scans. Terms absent from the index
+// are missing from the result (callers read them as 0 via the map).
+func (g *Geocoder) termDocCounts(ctx context.Context, tokens []string) (map[string]int64, error) {
+	db := g.app.DB()
+	if db == nil {
+		return nil, fmt.Errorf("db is not available")
+	}
+	if _, err := db.NewQuery(
+		`CREATE VIRTUAL TABLE IF NOT EXISTS geocoder_places_fts_vocab USING fts5vocab('geocoder_places_fts', 'row')`,
+	).Execute(); err != nil {
+		return nil, fmt.Errorf("failed to create fts vocab table: %w", err)
+	}
+
+	// Dedupe and lowercase (the FTS unicode61 tokenizer lowercases terms).
+	seen := make(map[string]bool, len(tokens))
+	terms := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		lt := strings.ToLower(t)
+		if len(lt) < 2 || seen[lt] {
+			continue
+		}
+		seen[lt] = true
+		terms = append(terms, lt)
+	}
+	counts := make(map[string]int64, len(terms))
+	if len(terms) == 0 {
+		return counts, nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString("SELECT term, doc FROM geocoder_places_fts_vocab WHERE term IN (")
+	params := make(dbx.Params, len(terms))
+	for i, t := range terms {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		key := fmt.Sprintf("t%d", i)
+		sb.WriteString("{:" + key + "}")
+		params[key] = t
+	}
+	sb.WriteByte(')')
+
+	var rows []struct {
+		Term string `db:"term"`
+		Doc  int64  `db:"doc"`
+	}
+	if err := db.NewQuery(sb.String()).Bind(params).All(&rows); err != nil {
+		return nil, fmt.Errorf("term doc count lookup failed: %w", err)
+	}
+	for _, r := range rows {
+		counts[r.Term] = r.Doc
+	}
+	return counts, nil
+}
+
+// cachedTermDocCounts returns per-term document counts like termDocCounts,
+// but memoized in the Geocoder instance. Query terms are highly repetitive
+// ("street", city names), so after warmup the vocab lookup almost never runs.
+func (g *Geocoder) cachedTermDocCounts(ctx context.Context, tokens []string) (map[string]int64, error) {
+	counts := make(map[string]int64, len(tokens))
+	var misses []string
+
+	g.termCountsMu.RLock()
+	seen := make(map[string]bool, len(tokens))
+	for _, t := range tokens {
+		lt := strings.ToLower(t)
+		if seen[lt] {
+			continue
+		}
+		seen[lt] = true
+		if c, ok := g.termCounts[lt]; ok {
+			counts[lt] = c
+		} else {
+			misses = append(misses, t)
+		}
+	}
+	g.termCountsMu.RUnlock()
+
+	if len(misses) > 0 {
+		fresh, err := g.termDocCounts(ctx, misses)
+		if err != nil {
+			return nil, err
+		}
+		g.termCountsMu.Lock()
+		if len(g.termCounts) > termCountsCacheCap {
+			g.termCounts = make(map[string]int64, termCountsCacheCap)
+		}
+		for _, t := range misses {
+			lt := strings.ToLower(t)
+			c := fresh[lt] // 0 when absent from the index
+			g.termCounts[lt] = c
+			counts[lt] = c
+		}
+		g.termCountsMu.Unlock()
+	}
+	return counts, nil
+}
+
+// minEffectiveCount returns the smallest estimated document count among the
+// tokens — the quantity that drives FTS5 intersection cost (other doclists
+// are probed from the smallest one). The final token in prefix mode is
+// weighted by prefixCostMultiplier. Terms missing from the index count as 0,
+// making strict matching trivially cheap. Pure function.
+func minEffectiveCount(tokens []string, counts map[string]int64, prefixLast bool) int64 {
+	if len(tokens) == 0 {
+		return 0
+	}
+	minC := int64(math.MaxInt64)
+	for i, t := range tokens {
+		c := counts[strings.ToLower(t)]
+		if prefixLast && i == len(tokens)-1 && len(t) >= 3 && len(t) <= 5 {
+			c *= prefixCostMultiplier
+		}
+		if c < minC {
+			minC = c
+		}
+	}
+	return minC
+}
+
+// pickAnchorTokens selects the tokens that generate fallback candidates. The
+// two rarest tokens always participate; further tokens join only while the
+// cumulative document count stays tiny (every token rare). Returns the anchor
+// tokens and whether they must be AND-ed (both rarest tokens are common, so
+// only their intersection is cheap and meaningful). Pure function.
+func pickAnchorTokens(tokens []string, counts map[string]int64) (anchors []string, useAND bool) {
+	type tokenCount struct {
+		t string
+		c int64
+	}
+	seen := make(map[string]bool, len(tokens))
+	cands := make([]tokenCount, 0, len(tokens))
+	for _, t := range tokens {
+		lt := strings.ToLower(t)
+		if len(lt) < 3 || seen[lt] { // mirror buildOrQuery's minimum length
+			continue
+		}
+		seen[lt] = true
+		cands = append(cands, tokenCount{t, counts[lt]})
+	}
+	if len(cands) == 0 {
+		return nil, false
+	}
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].c < cands[j].c })
+
+	anchors = []string{cands[0].t}
+	total := cands[0].c
+	if len(cands) == 1 {
+		return anchors, false
+	}
+	anchors = append(anchors, cands[1].t)
+	total += cands[1].c
+	if total > anchorDocThreshold {
+		return anchors, true
+	}
+	for i := 2; i < len(cands) && len(anchors) < 4; i++ {
+		if total+cands[i].c > anchorExtendBudget {
+			break
+		}
+		anchors = append(anchors, cands[i].t)
+		total += cands[i].c
+	}
+	return anchors, false
 }
 
 // ftsTokens splits a user query into tokens for FTS query building and result

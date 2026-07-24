@@ -208,6 +208,77 @@ func TestTokenHits(t *testing.T) {
 	}
 }
 
+func TestPickAnchorTokens(t *testing.T) {
+	counts := map[string]int64{"roux": 150, "bowdoin": 3443, "college": 85075, "center": 292620}
+
+	// The Bowdoin case: anchor on the two rare tokens only; "college" would
+	// blow the tiny extend budget and "center" is far too common.
+	anchors, useAND := pickAnchorTokens([]string{"Bowdoin", "College", "Roux", "Center"}, counts)
+	if useAND {
+		t.Error("rare-token query should use OR, not AND")
+	}
+	if len(anchors) != 2 || anchors[0] != "Roux" || anchors[1] != "Bowdoin" {
+		t.Errorf("anchors = %v, want [Roux Bowdoin] (rarest first)", anchors)
+	}
+
+	// Both tokens common: their intersection is the only cheap query.
+	anchors, useAND = pickAnchorTokens([]string{"center", "college"}, counts)
+	if !useAND {
+		t.Error("common-token query should use AND (intersection)")
+	}
+	if len(anchors) != 2 || anchors[0] != "college" || anchors[1] != "center" {
+		t.Errorf("anchors = %v, want [college center] (rarest first)", anchors)
+	}
+
+	// All tokens rare: extra anchors join the OR (better recall).
+	rare := map[string]int64{"roux": 150, "bowdoin": 3443, "schiller": 40}
+	anchors, useAND = pickAnchorTokens([]string{"bowdoin", "roux", "schiller"}, rare)
+	if useAND || len(anchors) != 3 {
+		t.Errorf("all-rare query: anchors = %v (useAND=%v), want 3 OR anchors", anchors, useAND)
+	}
+
+	// A term missing from the index counts as 0 and sorts first.
+	anchors, _ = pickAnchorTokens([]string{"bowdin", "roux"}, counts)
+	if len(anchors) != 2 || anchors[0] != "bowdin" || anchors[1] != "roux" {
+		t.Errorf("missing term: anchors = %v, want [bowdin roux]", anchors)
+	}
+
+	// Short tokens are skipped and duplicates removed.
+	anchors, _ = pickAnchorTokens([]string{"roux", "ab", "roux"}, counts)
+	if len(anchors) != 1 || anchors[0] != "roux" {
+		t.Errorf("dedupe/skip: anchors = %v, want [roux]", anchors)
+	}
+
+	// Nothing usable at all.
+	if anchors, _ := pickAnchorTokens([]string{"a", "bb"}, counts); len(anchors) != 0 {
+		t.Errorf("no valid tokens: anchors = %v, want empty", anchors)
+	}
+}
+
+func TestMinEffectiveCount(t *testing.T) {
+	counts := map[string]int64{"roux": 150, "bowdoin": 3443, "main": 436531, "street": 10530716}
+
+	// The rarest token drives intersection cost.
+	if got := minEffectiveCount([]string{"Bowdoin", "Street"}, counts, false); got != 3443 {
+		t.Errorf("minEffectiveCount = %d, want 3443 (case-insensitive)", got)
+	}
+	// Terms missing from the index count as 0 → strict matching is free.
+	if got := minEffectiveCount([]string{"nothere", "street"}, counts, false); got != 0 {
+		t.Errorf("missing term: got %d, want 0", got)
+	}
+	// Prefix mode weights the final short token (only 3-5 chars).
+	if got := minEffectiveCount([]string{"street", "main"}, counts, true); got != 436531*prefixCostMultiplier {
+		t.Errorf("prefix weighting: got %d, want %d", got, 436531*prefixCostMultiplier)
+	}
+	// Long final token is not prefix-expanded, so no weighting.
+	if got := minEffectiveCount([]string{"street", "bowdoin"}, counts, true); got != 3443 {
+		t.Errorf("no prefix on long token: got %d, want 3443", got)
+	}
+	if got := minEffectiveCount(nil, counts, false); got != 0 {
+		t.Errorf("empty tokens: got %d, want 0", got)
+	}
+}
+
 func TestNormalizeStreetName(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"Birchwood Road", "Birchwood Rd"},
