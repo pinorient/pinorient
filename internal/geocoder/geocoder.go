@@ -59,6 +59,15 @@ const (
 	// StateTigerFTSOffset holds the last committed rowid during a chunked
 	// TIGER FTS rebuild (deleted on completion).
 	StateTigerFTSOffset = "tiger_fts_offset"
+	// StateOSMNodeCoordsDone is set when the coordinates of all way-referenced
+	// nodes have been collected into the _osm_node_coords table.
+	StateOSMNodeCoordsDone = "osm_nodecoords_done"
+	// StateOSMWayCoordsDone is set when every indexed way has been assigned a
+	// centroid from its member nodes.
+	StateOSMWayCoordsDone = "osm_waycoords_done"
+	// StateOSMWayCoordsOffset holds the last committed way OSM ID during the
+	// chunked way-centroid pass (deleted on completion).
+	StateOSMWayCoordsOffset = "osm_waycoords_offset"
 )
 
 // maxInsertVars caps the number of bound variables per INSERT statement.
@@ -186,37 +195,20 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 		places = append(places, tigerPlaces...)
 	}
 
-	// Use FTS5 to match the query across indexed fields.
-	// When a bbox is provided, add a coordinate filter.
-	bboxClause := ""
-	params := dbx.Params{"query": q, "limit": limit}
-	if bbox != nil && bbox.Valid() {
-		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
-		       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
-		params["min_lat"] = bbox.MinLat
-		params["max_lat"] = bbox.MaxLat
-		params["min_lng"] = bbox.MinLng
-		params["max_lng"] = bbox.MaxLng
-	}
-
-	query := fmt.Sprintf(`
-		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
-		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
-		       p.created, p.updated
-		FROM geocoder_places p
-		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
-		WHERE geocoder_places_fts MATCH {:query}
-		%s
-		ORDER BY bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)
-		LIMIT {:limit}
-	`, bboxClause)
-
-	var osmPlaces []models.Place
-	if err := db.
-		NewQuery(query).
-		Bind(params).
-		All(&osmPlaces); err != nil {
+	// Use FTS5 to match the query across indexed fields. The raw query is a
+	// phrase match (all tokens adjacent, in order) — the highest-precision
+	// interpretation. When it matches nothing, progressively looser tokenized
+	// fallbacks kick in (see fallbackPartialMatch).
+	const orderBy = "bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)"
+	osmPlaces, err := g.ftsPlaces(ctx, q, limit, bbox, orderBy)
+	if err != nil {
 		return nil, fmt.Errorf("search failed: %w", err)
+	}
+	if len(osmPlaces) == 0 {
+		osmPlaces, err = g.fallbackPartialMatch(ctx, q, limit, bbox, orderBy, false)
+		if err != nil {
+			return nil, fmt.Errorf("search failed: %w", err)
+		}
 	}
 
 	places = append(places, osmPlaces...)
@@ -248,36 +240,19 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 		return []models.Place{}, nil
 	}
 
-	// When a bbox is provided, add a coordinate filter.
-	bboxClause := ""
-	params := dbx.Params{"query": ftsQuery, "limit": limit}
-	if bbox != nil && bbox.Valid() {
-		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
-		       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
-		params["min_lat"] = bbox.MinLat
-		params["max_lat"] = bbox.MaxLat
-		params["min_lng"] = bbox.MinLng
-		params["max_lng"] = bbox.MaxLng
-	}
-
-	query := fmt.Sprintf(`
-		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
-		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
-		       p.created, p.updated
-		FROM geocoder_places p
-		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
-		WHERE geocoder_places_fts MATCH {:query}
-		%s
-		ORDER BY rank
-		LIMIT {:limit}
-	`, bboxClause)
-
-	var places []models.Place
-	if err := db.
-		NewQuery(query).
-		Bind(params).
-		All(&places); err != nil {
+	places, err := g.ftsPlaces(ctx, ftsQuery, limit, bbox, "rank")
+	if err != nil {
 		return nil, fmt.Errorf("autocomplete failed: %w", err)
+	}
+	if len(places) == 0 {
+		// The strict all-token prefix query matched nothing (e.g. an
+		// institution + building name spanning multiple OSM features).
+		// Fall back to a ranked partial match.
+		places, err = g.fallbackPartialMatch(ctx, q, limit, bbox,
+			"bm25(geocoder_places_fts, 10.0, 1.0, 1.0, 1.0, 1.0)", true)
+		if err != nil {
+			return nil, fmt.Errorf("autocomplete failed: %w", err)
+		}
 	}
 
 	// Try TIGER address interpolation if the query starts with a house number.
@@ -345,6 +320,209 @@ func buildPrefixQuery(q string) string {
 	}
 
 	return strings.Join(parts, " AND ")
+}
+
+const (
+	// maxFallbackTokens caps how many query tokens the partial-match fallback
+	// considers. Beyond this the OR query becomes too broad to be useful.
+	maxFallbackTokens = 8
+	// orFetchFactor over-fetches OR-fallback candidates relative to the
+	// requested limit so the multi-token preference has rows to work with.
+	orFetchFactor = 4
+	// orFetchMin/orFetchMax bound the OR-fallback candidate fetch size.
+	orFetchMin = 20
+	orFetchMax = 100
+)
+
+// ftsPlaces runs a single FTS5 query against geocoder_places_fts and returns
+// up to limit places, optionally filtered to bbox. orderBy is an internal
+// constant SQL expression ("rank" or a bm25(...) call), never user input.
+func (g *Geocoder) ftsPlaces(ctx context.Context, ftsQuery string, limit int, bbox *BBox, orderBy string) ([]models.Place, error) {
+	db := g.app.DB()
+	if db == nil {
+		return nil, fmt.Errorf("db is not available")
+	}
+
+	// When a bbox is provided, add a coordinate filter.
+	bboxClause := ""
+	params := dbx.Params{"query": ftsQuery, "limit": limit}
+	if bbox != nil && bbox.Valid() {
+		bboxClause = `AND p.lat >= {:min_lat} AND p.lat <= {:max_lat}
+		       AND p.lon >= {:min_lng} AND p.lon <= {:max_lng}`
+		params["min_lat"] = bbox.MinLat
+		params["max_lat"] = bbox.MaxLat
+		params["min_lng"] = bbox.MinLng
+		params["max_lng"] = bbox.MaxLng
+	}
+
+	query := fmt.Sprintf(`
+		SELECT p.id, p.osm_id, p.osm_type, p.name, p.address, p.city, p.state,
+		       p.postcode, p.country, p.lat, p.lon, p.class, p.type, p.importance,
+		       p.created, p.updated
+		FROM geocoder_places p
+		INNER JOIN geocoder_places_fts f ON p.rowid = f.rowid
+		WHERE geocoder_places_fts MATCH {:query}
+		%s
+		ORDER BY %s
+		LIMIT {:limit}
+	`, bboxClause, orderBy)
+
+	var places []models.Place
+	if err := db.
+		NewQuery(query).
+		Bind(params).
+		All(&places); err != nil {
+		return nil, err
+	}
+	return places, nil
+}
+
+// fallbackPartialMatch runs progressively looser FTS5 matching for queries
+// whose strict interpretation matched nothing. Real-world place queries often
+// span multiple OSM features ("Bowdoin College Roux Center" = the campus named
+// "Bowdoin College" plus the building named "Roux Center ..."), so requiring
+// every token in one record returns nothing at all. Photon/Nominatim handle
+// this with ranked partial matching; this is the SQLite equivalent:
+//
+//  1. tokenized AND — every token must match, but in any field and any order
+//     (skipped for prefix matching, where the caller already tried an AND);
+//  2. ranked OR — bm25 naturally surfaces rows matching the rare tokens, and
+//     preferMultiTokenMatches keeps rows matching 2+ tokens ahead of
+//     single-token noise.
+//
+// prefixLast enables autocomplete-style prefix matching on the final token.
+func (g *Geocoder) fallbackPartialMatch(ctx context.Context, q string, limit int, bbox *BBox, orderBy string, prefixLast bool) ([]models.Place, error) {
+	tokens := ftsTokens(q)
+	if len(tokens) < 2 || len(tokens) > maxFallbackTokens {
+		// A single token gains nothing from an OR (identical to the AND),
+		// and very long queries make the OR too broad to be meaningful.
+		return nil, nil
+	}
+
+	if !prefixLast {
+		if andQuery := buildAndQuery(tokens); andQuery != "" {
+			places, err := g.ftsPlaces(ctx, andQuery, limit, bbox, orderBy)
+			if err != nil {
+				return nil, err
+			}
+			if len(places) > 0 {
+				return places, nil
+			}
+		}
+	}
+
+	orQuery := buildOrQuery(tokens, prefixLast)
+	if orQuery == "" {
+		return nil, nil
+	}
+	fetch := limit * orFetchFactor
+	if fetch < orFetchMin {
+		fetch = orFetchMin
+	}
+	if fetch > orFetchMax {
+		fetch = orFetchMax
+	}
+	candidates, err := g.ftsPlaces(ctx, orQuery, fetch, bbox, orderBy)
+	if err != nil {
+		return nil, err
+	}
+	return preferMultiTokenMatches(candidates, tokens, limit), nil
+}
+
+// ftsTokens splits a user query into tokens for FTS query building and result
+// filtering. Double quotes are stripped since they would break FTS5 quoted
+// phrases.
+func ftsTokens(q string) []string {
+	raw := strings.Fields(q)
+	tokens := make([]string, 0, len(raw))
+	for _, t := range raw {
+		t = strings.TrimSpace(strings.ReplaceAll(t, "\"", ""))
+		if t != "" {
+			tokens = append(tokens, t)
+		}
+	}
+	return tokens
+}
+
+// buildAndQuery builds an FTS5 query requiring every token to match, in any
+// field and any order. Tokens shorter than 2 characters are skipped.
+func buildAndQuery(tokens []string) string {
+	var parts []string
+	for _, t := range tokens {
+		if len(t) < 2 {
+			continue
+		}
+		parts = append(parts, "\""+t+"\"")
+	}
+	return strings.Join(parts, " AND ")
+}
+
+// buildOrQuery builds a loose FTS5 OR query for ranked fallback matching.
+// It mirrors buildPrefixQuery's rules: tokens shorter than 3 characters are
+// skipped entirely, and when prefixLast is set the final token (3-5 chars)
+// becomes a prefix wildcard.
+func buildOrQuery(tokens []string, prefixLast bool) string {
+	var parts []string
+	for i, t := range tokens {
+		if len(t) < 3 {
+			continue
+		}
+		if prefixLast && i == len(tokens)-1 && len(t) <= 5 {
+			parts = append(parts, t+"*")
+		} else {
+			parts = append(parts, "\""+t+"\"")
+		}
+	}
+	return strings.Join(parts, " OR ")
+}
+
+// preferMultiTokenMatches reorders OR-fallback candidates so places matching
+// at least two query tokens come first (preserving their FTS rank order),
+// then fills any remaining slots with single-token matches. Pure function.
+func preferMultiTokenMatches(candidates []models.Place, tokens []string, limit int) []models.Place {
+	if len(candidates) == 0 {
+		return candidates
+	}
+
+	lower := make([]string, 0, len(tokens))
+	for _, t := range tokens {
+		if t = strings.ToLower(t); len(t) >= 2 {
+			lower = append(lower, t)
+		}
+	}
+	minHits := 2
+	if len(lower) < 2 {
+		minHits = len(lower)
+	}
+
+	multi := make([]models.Place, 0, len(candidates))
+	single := make([]models.Place, 0, len(candidates))
+	for _, p := range candidates {
+		if tokenHits(&p, lower) >= minHits {
+			multi = append(multi, p)
+		} else {
+			single = append(single, p)
+		}
+	}
+	out := append(multi, single...)
+	if len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+// tokenHits counts how many of the given tokens appear in the place's
+// searchable text fields. Matching is case-insensitive and substring-based so
+// autocomplete prefix tokens also count as hits.
+func tokenHits(p *models.Place, tokens []string) int {
+	haystack := strings.ToLower(p.Name + " " + p.Address + " " + p.City + " " + p.State + " " + p.Postcode)
+	hits := 0
+	for _, t := range tokens {
+		if strings.Contains(haystack, strings.ToLower(t)) {
+			hits++
+		}
+	}
+	return hits
 }
 
 // Reverse performs a reverse geocoding lookup for the given coordinates.
@@ -944,11 +1122,11 @@ func (g *Geocoder) DropNodeCoordTable(ctx context.Context) error {
 	return nil
 }
 
-// BatchInsertNodeCoords inserts node coordinates in batches.
+// BatchInsertNodeCoords inserts node coordinates in batches using multi-row
+// INSERT statements (see execMultiValueInsert). Re-runs are idempotent.
 func (g *Geocoder) BatchInsertNodeCoords(ctx context.Context, coords []NodeCoord) error {
-	db := g.app.NonconcurrentDB()
-	if db == nil {
-		return fmt.Errorf("db is not available")
+	if len(coords) == 0 {
+		return nil
 	}
 
 	txErr := g.app.RunInTransaction(func(txApp core.App) error {
@@ -957,19 +1135,12 @@ func (g *Geocoder) BatchInsertNodeCoords(ctx context.Context, coords []NodeCoord
 			return fmt.Errorf("transaction db is not available")
 		}
 
-		query := `INSERT OR REPLACE INTO _osm_node_coords (osm_id, lat, lon) VALUES ({:osm_id}, {:lat}, {:lon})`
-
-		for _, c := range coords {
-			if _, err := txDB.NewQuery(query).Bind(dbx.Params{
-				"osm_id": c.OSMID,
-				"lat":    c.Lat,
-				"lon":    c.Lon,
-			}).Execute(); err != nil {
-				return err
-			}
+		rows := make([][]any, len(coords))
+		for i, c := range coords {
+			rows[i] = []any{c.OSMID, c.Lat, c.Lon}
 		}
-
-		return nil
+		return execMultiValueInsert(txDB,
+			"INSERT OR REPLACE INTO _osm_node_coords (osm_id, lat, lon) VALUES ", "", "", rows)
 	})
 
 	if txErr != nil {
@@ -977,6 +1148,57 @@ func (g *Geocoder) BatchInsertNodeCoords(ctx context.Context, coords []NodeCoord
 	}
 
 	return nil
+}
+
+// LookupNodeCoords returns the stored coordinates for the given node IDs.
+// IDs absent from _osm_node_coords (e.g. clipped at extract boundaries) are
+// simply missing from the result map. Lookup keys are chunked to stay under
+// SQLite's bound-variable limit.
+func (g *Geocoder) LookupNodeCoords(ctx context.Context, ids []int64) (map[int64][2]float64, error) {
+	coords := make(map[int64][2]float64, len(ids))
+	if len(ids) == 0 {
+		return coords, nil
+	}
+
+	db := g.app.DB()
+	if db == nil {
+		return nil, fmt.Errorf("db is not available")
+	}
+
+	for start := 0; start < len(ids); start += maxInsertVars {
+		end := start + maxInsertVars
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+
+		var sb strings.Builder
+		sb.WriteString("SELECT osm_id, lat, lon FROM _osm_node_coords WHERE osm_id IN (")
+		params := make(dbx.Params, len(chunk))
+		for i, id := range chunk {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			key := fmt.Sprintf("n%d", i)
+			sb.WriteString("{:" + key + "}")
+			params[key] = id
+		}
+		sb.WriteByte(')')
+
+		var rows []struct {
+			OSMID int64   `db:"osm_id"`
+			Lat   float64 `db:"lat"`
+			Lon   float64 `db:"lon"`
+		}
+		if err := db.NewQuery(sb.String()).Bind(params).All(&rows); err != nil {
+			return nil, fmt.Errorf("lookup node coords failed: %w", err)
+		}
+		for _, r := range rows {
+			coords[r.OSMID] = [2]float64{r.Lat, r.Lon}
+		}
+	}
+
+	return coords, nil
 }
 
 // GetWayCentroid computes the centroid (average lat/lon) of a way from its node references.
@@ -1015,6 +1237,89 @@ func (g *Geocoder) GetWayCentroid(ctx context.Context, nodeIDs []int64) (float64
 	}
 
 	return result.AvgLat, result.AvgLon, nil
+}
+
+// WayCoordUpdate assigns a resolved centroid to one way place row.
+type WayCoordUpdate struct {
+	ID  string // place ID, e.g. "way/12345"
+	Lat float64
+	Lon float64
+}
+
+// CreateWayCoordUpdateTable creates the scratch table used to batch way
+// centroid updates. It lives in the main database (not TEMP) so the batched
+// UPDATE ... FROM can join against geocoder_places, and it is dropped when
+// the resolution phase completes.
+func (g *Geocoder) CreateWayCoordUpdateTable(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+
+	if _, err := db.NewQuery(`CREATE TABLE IF NOT EXISTS _way_coord_updates (
+id TEXT PRIMARY KEY,
+lat REAL NOT NULL,
+lon REAL NOT NULL
+)`).Execute(); err != nil {
+		return fmt.Errorf("failed to create way coord update table: %w", err)
+	}
+	// Clear leftovers from an interrupted earlier run.
+	if _, err := db.NewQuery("DELETE FROM _way_coord_updates").Execute(); err != nil {
+		return fmt.Errorf("failed to clear way coord update table: %w", err)
+	}
+	return nil
+}
+
+// DropWayCoordUpdateTable drops the centroid-update scratch table.
+func (g *Geocoder) DropWayCoordUpdateTable(ctx context.Context) error {
+	db := g.app.NonconcurrentDB()
+	if db == nil {
+		return fmt.Errorf("db is not available")
+	}
+	if _, err := db.NewQuery("DROP TABLE IF EXISTS _way_coord_updates").Execute(); err != nil {
+		return fmt.Errorf("failed to drop way coord update table: %w", err)
+	}
+	return nil
+}
+
+// ApplyWayCoordUpdates applies one chunk of way centroid assignments and
+// records the scan position (afterWayID) in the same transaction, so an
+// interrupted resolution pass resumes exactly after the last committed way.
+func (g *Geocoder) ApplyWayCoordUpdates(ctx context.Context, updates []WayCoordUpdate, afterWayID int64) error {
+	txErr := g.app.RunInTransaction(func(txApp core.App) error {
+		txDB := txApp.NonconcurrentDB()
+		if txDB == nil {
+			return fmt.Errorf("transaction db is not available")
+		}
+
+		if len(updates) > 0 {
+			rows := make([][]any, len(updates))
+			for i, u := range updates {
+				rows[i] = []any{u.ID, u.Lat, u.Lon}
+			}
+			if err := execMultiValueInsert(txDB,
+				"INSERT OR REPLACE INTO _way_coord_updates (id, lat, lon) VALUES ", "", "", rows); err != nil {
+				return err
+			}
+			if _, err := txDB.NewQuery(`UPDATE geocoder_places SET lat = u.lat, lon = u.lon
+				FROM _way_coord_updates u WHERE geocoder_places.id = u.id`).Execute(); err != nil {
+				return fmt.Errorf("failed to apply way coord updates: %w", err)
+			}
+			if _, err := txDB.NewQuery("DELETE FROM _way_coord_updates").Execute(); err != nil {
+				return err
+			}
+		}
+
+		_, err := txDB.NewQuery(`INSERT INTO _import_state (key, value) VALUES ({:key}, {:value})
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value`).
+			Bind(dbx.Params{"key": StateOSMWayCoordsOffset, "value": strconv.FormatInt(afterWayID, 10)}).Execute()
+		return err
+	})
+
+	if txErr != nil {
+		return fmt.Errorf("apply way coord updates failed: %w", txErr)
+	}
+	return nil
 }
 
 // AddrRange represents a TIGER/Line address range record.

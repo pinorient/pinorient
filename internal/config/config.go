@@ -82,6 +82,21 @@ type Config struct {
 	// don't have to re-download the (multi-GB) extract. Set OSM_KEEP_DATA=false
 	// to delete the file after import on space-constrained servers.
 	OSMKeepData bool
+
+	// WayCoordsEnabled controls way centroid resolution after OSM imports:
+	// every indexed way (buildings, POIs, streets) gets lat/lon computed from
+	// its member nodes. Defaults to true — without it, all way rows sit at
+	// 0,0 and are useless for display, bbox filtering, and reverse geocoding.
+	// Requires ~6-8GB of temporary disk for the node-coordinate table during
+	// the import (dropped afterwards). Set WAY_COORDS_ENABLED=false to skip.
+	WayCoordsEnabled bool
+
+	// WayCoordsBloomMB sizes the bloom filter (in MiB) used to select
+	// way-referenced node IDs during the coordinate pass. Defaults to 256,
+	// which keeps false positives to a few percent for the US extract
+	// (~500M node references). The filter is held in RAM only during that
+	// pass. Minimum 32 (too small to be useful for the US extract).
+	WayCoordsBloomMB int
 }
 
 // Load reads configuration from environment variables.
@@ -107,6 +122,9 @@ func Load() *Config {
 		TIGERKeepData: getEnv("TIGER_KEEP_DATA", "") == "true" || getEnv("TIGER_KEEP_DATA", "") == "1",
 		// OSM_KEEP_DATA defaults to true so re-indexes don't re-download the extract.
 		OSMKeepData: getEnv("OSM_KEEP_DATA", "true") != "false" && getEnv("OSM_KEEP_DATA", "true") != "0",
+		// WAY_COORDS_ENABLED defaults to true: way rows get real coordinates.
+		WayCoordsEnabled: getEnv("WAY_COORDS_ENABLED", "true") != "false" && getEnv("WAY_COORDS_ENABLED", "true") != "0",
+		WayCoordsBloomMB: getEnvInt("WAY_COORDS_BLOOM_MB", 256),
 	}
 }
 

@@ -42,9 +42,10 @@ func NewParser(geo *geocoder.Geocoder, batchSize, numWorkers int) *Parser {
 }
 
 // Parse reads OSM PBF data from r and indexes addressable places.
-// Both nodes and ways are indexed in a single pass. Ways with address tags
-// are indexed even though they don't have coordinates (lat/lon = 0) —
-// the FTS search finds them by text, and coordinates can be resolved later.
+// Both nodes and ways are indexed in a single pass. Ways are indexed without
+// coordinates (lat/lon = 0) because the PBF format gives ways no node
+// geometry; the scheduler resolves their centroids from the same extract in a
+// later phase (see waycoords.go).
 //
 // FTS triggers are temporarily dropped during import to avoid per-row FTS
 // overhead. The caller is responsible for rebuilding the FTS index afterwards
@@ -146,6 +147,14 @@ func hasAddressTags(tags map[string]string) bool {
 	return false
 }
 
+// isIndexedWay reports whether a way becomes a geocoder_places row. It mirrors
+// the acceptance rules in wayToPlace (a name, or enough addr: tags to build
+// one) and is used by the way-coordinates phase to select exactly the ways
+// that need centroids.
+func isIndexedWay(w *osmpbf.Way) bool {
+	return w.Tags["name"] != "" || w.Tags["addr:housenumber"] != "" || w.Tags["addr:street"] != ""
+}
+
 // buildAddress constructs a display address string from addr: tags.
 func buildAddress(tags map[string]string) string {
 	var parts []string
@@ -161,6 +170,64 @@ func buildAddress(tags map[string]string) string {
 	}
 
 	return strings.Join(parts, ", ")
+}
+
+// classKeys lists OSM tag keys that define a feature's class, in priority
+// order (most descriptive first). Photon/Nominatim derive their
+// osm_key/osm_value (class/type) the same way; OSM itself has no literal
+// "class" tag, so reading tags["class"] always came back empty.
+var classKeys = []string{
+	"place", "boundary", "amenity", "healthcare", "office", "shop", "craft",
+	"tourism", "leisure", "historic", "sport", "public_transport", "railway",
+	"aeroway", "highway", "waterway", "natural", "landuse", "building",
+	"man_made", "power", "military", "emergency", "telecom",
+}
+
+// classType derives the (class, type) pair for a feature from its OSM tags,
+// e.g. {amenity: "university"} -> ("amenity", "university"). The first key
+// from classKeys present on the feature wins.
+func classType(tags map[string]string) (class, typ string) {
+	for _, k := range classKeys {
+		if v := tags[k]; v != "" {
+			return k, v
+		}
+	}
+	return "", ""
+}
+
+// placeImportance assigns a coarse importance score (0-1) to a feature for
+// result ranking: named settlements outrank named POIs, which outrank street
+// addresses. (Stored for ranking/Photon compatibility; OSM provides no
+// importance signal of its own.)
+func placeImportance(tags map[string]string, class string) float64 {
+	switch tags["place"] {
+	case "city":
+		return 0.45
+	case "town":
+		return 0.40
+	case "village":
+		return 0.35
+	case "suburb", "quarter", "borough":
+		return 0.30
+	case "neighbourhood":
+		return 0.28
+	case "hamlet", "locality":
+		return 0.25
+	case "island", "islet":
+		return 0.20
+	}
+
+	if tags["name"] == "" {
+		return 0
+	}
+	switch class {
+	case "amenity", "healthcare", "office", "shop", "tourism", "leisure",
+		"historic", "aeroway", "railway", "natural", "waterway":
+		return 0.15
+	case "highway":
+		return 0.10
+	}
+	return 0.05
 }
 
 // nodeToPlace converts an OSM node to a Place if it has a name or address tags.
@@ -184,34 +251,35 @@ func nodeToPlace(n *osmpbf.Node) *models.Place {
 		}
 	}
 
+	class, typ := classType(n.Tags)
 	return &models.Place{
-		ID:       fmt.Sprintf("node/%d", n.ID),
-		OSMID:    n.ID,
-		OSMType:  "node",
-		Name:     name,
-		Address:  buildAddress(n.Tags),
-		City:     firstTag(n.Tags, "addr:city", "city"),
-		State:    firstTag(n.Tags, "addr:state", "state"),
-		Postcode: firstTag(n.Tags, "addr:postcode", "postcode"),
-		Country:  firstTag(n.Tags, "addr:country", "country"),
-		Lat:      n.Lat,
-		Lon:      n.Lon,
-		Class:    n.Tags["class"],
-		Type:     n.Tags["type"],
+		ID:         fmt.Sprintf("node/%d", n.ID),
+		OSMID:      n.ID,
+		OSMType:    "node",
+		Name:       name,
+		Address:    buildAddress(n.Tags),
+		City:       firstTag(n.Tags, "addr:city", "city"),
+		State:      firstTag(n.Tags, "addr:state", "state"),
+		Postcode:   firstTag(n.Tags, "addr:postcode", "postcode"),
+		Country:    firstTag(n.Tags, "addr:country", "country"),
+		Lat:        n.Lat,
+		Lon:        n.Lon,
+		Class:      class,
+		Type:       typ,
+		Importance: placeImportance(n.Tags, class),
 	}
 }
 
 // wayToPlace converts an OSM way to a Place if it has a name or address tags.
 // Ways with addr:housenumber but no addr:street are also indexed.
-// Ways don't have coordinates in this library, so lat/lon are left as 0.
+// Ways carry no coordinates in the PBF, so lat/lon are left as 0 here; the
+// way-coordinates phase (waycoords.go) resolves centroids after the import.
 func wayToPlace(w *osmpbf.Way) *models.Place {
-	name := w.Tags["name"]
-	hasAddr := hasAddressTags(w.Tags)
-
-	if name == "" && !hasAddr {
+	if !isIndexedWay(w) {
 		return nil
 	}
 
+	name := w.Tags["name"]
 	if name == "" {
 		housenumber := firstTag(w.Tags, "addr:housenumber")
 		street := firstTag(w.Tags, "addr:street")
@@ -226,18 +294,20 @@ func wayToPlace(w *osmpbf.Way) *models.Place {
 		}
 	}
 
+	class, typ := classType(w.Tags)
 	return &models.Place{
-		ID:       fmt.Sprintf("way/%d", w.ID),
-		OSMID:    w.ID,
-		OSMType:  "way",
-		Name:     name,
-		Address:  buildAddress(w.Tags),
-		City:     firstTag(w.Tags, "addr:city", "city"),
-		State:    firstTag(w.Tags, "addr:state", "state"),
-		Postcode: firstTag(w.Tags, "addr:postcode", "postcode"),
-		Country:  firstTag(w.Tags, "addr:country", "country"),
-		Class:    w.Tags["class"],
-		Type:     w.Tags["type"],
+		ID:         fmt.Sprintf("way/%d", w.ID),
+		OSMID:      w.ID,
+		OSMType:    "way",
+		Name:       name,
+		Address:    buildAddress(w.Tags),
+		City:       firstTag(w.Tags, "addr:city", "city"),
+		State:      firstTag(w.Tags, "addr:state", "state"),
+		Postcode:   firstTag(w.Tags, "addr:postcode", "postcode"),
+		Country:    firstTag(w.Tags, "addr:country", "country"),
+		Class:      class,
+		Type:       typ,
+		Importance: placeImportance(w.Tags, class),
 	}
 }
 

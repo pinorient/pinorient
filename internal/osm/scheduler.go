@@ -100,6 +100,34 @@ func (s *Scheduler) EnsureIndexed(ctx context.Context, app core.App) error {
 		}
 	}
 
+	// Resolve way centroids for databases imported before way-coordinate
+	// support existed (a one-time backfill) or after an interrupted resolution
+	// pass (a resume). The updates touch lat/lon only, so the FTS index stays
+	// valid. The extract is re-downloaded if it was deleted after import.
+	if s.cfg.WayCoordsEnabled {
+		pd, err := s.geo.GetImportState(ctx, geocoder.StateOSMPlacesDone)
+		if err != nil {
+			return fmt.Errorf("failed to check OSM import state: %w", err)
+		}
+		if pd == "done" {
+			wd, err := s.geo.GetImportState(ctx, geocoder.StateOSMWayCoordsDone)
+			if err != nil {
+				return fmt.Errorf("failed to check way coords state: %w", err)
+			}
+			if wd != "done" {
+				app.Logger().Info("resolving way coordinates from the OSM extract (one-time backfill/resume)...")
+				path, err := s.ensureOSMExtract(ctx)
+				if err != nil {
+					return err
+				}
+				if err := s.resolveWayCoords(ctx, path); err != nil {
+					return fmt.Errorf("way coordinate resolution failed: %w", err)
+				}
+				s.geo.Checkpoint(ctx)
+			}
+		}
+	}
+
 	// Places import is complete. Now ensure the FTS index is fully built.
 	// RebuildFTS resumes from the last committed chunk if a previous rebuild
 	// was interrupted.
@@ -440,6 +468,30 @@ func parseCountyFIPSFromDBF(dbfPath string) ([]string, error) {
 	return fipsCodes, nil
 }
 
+// osmExtractPath returns the local path of the downloaded OSM PBF extract.
+func (s *Scheduler) osmExtractPath() string {
+	return filepath.Join(s.cfg.OSMDataPath, "us-latest.osm.pbf")
+}
+
+// ensureOSMExtract makes sure the OSM PBF extract exists locally, downloading
+// it if missing. The way-coordinates backfill needs the extract even on
+// servers where it was deleted after the original import.
+func (s *Scheduler) ensureOSMExtract(ctx context.Context) (string, error) {
+	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create data directory: %w", err)
+	}
+
+	path := s.osmExtractPath()
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		log.Printf("downloading osm data from %s...", s.cfg.OSMDataURL)
+		if err := downloadFile(ctx, s.cfg.OSMDataURL, path); err != nil {
+			return "", fmt.Errorf("failed to download osm data: %w", err)
+		}
+		log.Printf("osm data downloaded to %s", path)
+	}
+	return path, nil
+}
+
 // Refresh downloads the latest OSM extract and re-indexes places, then rebuilds
 // the FTS index as a chunked, resumable operation.
 //
@@ -453,22 +505,11 @@ func parseCountyFIPSFromDBF(dbfPath string) ([]string, error) {
 // To force a clean re-import (removing stale records), set FORCE_REINDEX=true
 // and manually clear the index before starting.
 func (s *Scheduler) Refresh(ctx context.Context) error {
-	if err := os.MkdirAll(s.cfg.OSMDataPath, 0o755); err != nil {
-		return fmt.Errorf("failed to create data directory: %w", err)
+	path, err := s.ensureOSMExtract(ctx)
+	if err != nil {
+		return err
 	}
-
-	path := filepath.Join(s.cfg.OSMDataPath, "us-latest.osm.pbf")
-
-	// Skip download if the file already exists (useful for development).
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		log.Printf("downloading osm data from %s...", s.cfg.OSMDataURL)
-		if err := downloadFile(ctx, s.cfg.OSMDataURL, path); err != nil {
-			return fmt.Errorf("failed to download osm data: %w", err)
-		}
-		log.Printf("osm data downloaded to %s", path)
-	} else {
-		log.Printf("using existing osm data at %s", path)
-	}
+	log.Printf("using osm data at %s", path)
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -489,6 +530,17 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 	if err := s.geo.DeleteImportState(ctx, geocoder.StateOSMFTSDone); err != nil {
 		log.Printf("warning: failed to clear OSM FTS state: %v", err)
 	}
+	// The way-coordinate phases re-run against the fresh extract. Clear their
+	// markers and any stale temp state left by an interrupted earlier run.
+	for _, key := range []string{geocoder.StateOSMNodeCoordsDone, geocoder.StateOSMWayCoordsDone, geocoder.StateOSMWayCoordsOffset} {
+		if err := s.geo.DeleteImportState(ctx, key); err != nil {
+			log.Printf("warning: failed to clear %s: %v", key, err)
+		}
+	}
+	_ = os.Remove(filepath.Join(s.cfg.OSMDataPath, "way_nodes.bloom"))
+	if err := s.geo.DropNodeCoordTable(ctx); err != nil {
+		log.Printf("warning: failed to drop stale node coords table: %v", err)
+	}
 
 	parser := NewParser(s.geo, s.cfg.ImportBatchSize, s.cfg.OSMDecoderWorkers)
 	if err := parser.Parse(ctx, f); err != nil {
@@ -508,6 +560,13 @@ func (s *Scheduler) Refresh(ctx context.Context) error {
 	if err := s.geo.SetImportState(ctx, geocoder.StateOSMPlacesDone, "done"); err != nil {
 		log.Printf("warning: failed to mark OSM import complete: %v", err)
 	}
+
+	// Resolve centroids for all indexed ways from the freshly parsed extract
+	// (crash-resumable phases; see waycoords.go).
+	if err := s.resolveWayCoords(ctx, path); err != nil {
+		return fmt.Errorf("failed to resolve way coordinates: %w", err)
+	}
+	s.geo.Checkpoint(ctx)
 
 	// Rebuild the FTS index in committed chunks (crash-resumable; a previous
 	// interrupted rebuild resumes from its last committed chunk).

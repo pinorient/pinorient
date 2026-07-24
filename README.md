@@ -13,6 +13,9 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 - OSM PBF parsing via `qedus/osmpbf`
 - Forward geocoding (`/api/geocoder/search?q=...`)
 - Reverse geocoding (`/api/geocoder/reverse?lat=...&lon=...`)
+- **Ranked partial matching** — queries spanning multiple features (e.g. `Bowdoin College Roux Center`) return the best partial matches instead of nothing
+- **Way centroids** — buildings, POIs, and streets mapped as OSM ways get real coordinates resolved from their member nodes (no more `lat/lon = 0`)
+- **Class/type & importance** — OSM tags are distilled into Photon-style class/type (e.g. `amenity`/`university`) plus a coarse importance score
 - **Bounding box filtering** — limit search/autocomplete results to a geographic area (`bbox` parameter)
 - Domain-based access restriction with wildcard support (`*.mysite.com`)
 - Periodic OSM data refresh via cron expression
@@ -57,6 +60,8 @@ Configuration is read from environment variables. A `.env` file is **optional** 
 | `TIGER_FORCE_REIMPORT` | Force re-import of TIGER/Line data on startup | *(empty = disabled)* |
 | `TIGER_KEEP_DATA` | Keep TIGER ZIPs/shapefiles after import (`false` deletes them per county) | `false` |
 | `OSM_KEEP_DATA` | Keep the downloaded OSM PBF after a successful import | `true` |
+| `WAY_COORDS_ENABLED` | Resolve way centroids after each OSM import (ways get real coordinates) | `true` |
+| `WAY_COORDS_BLOOM_MB` | MiB of RAM for the way-node bloom filter used during coordinate resolution | `256` |
 | `IMPORT_BATCH_SIZE` | Records buffered per DB transaction during imports | `2000` |
 | `OSM_DECODER_WORKERS` | Goroutines for OSM PBF decoding (each uses extra memory) | `2` |
 | `SERIALIZE_IMPORTS` | Run OSM and TIGER imports sequentially (halves peak memory) | `true` |
@@ -109,6 +114,12 @@ This re-imports all OSM data from the downloaded PBF file (existing rows are upd
 
 The importer uses batched transactions with multi-row INSERT statements (2,000 records per batch by default, configurable via `IMPORT_BATCH_SIZE`) for dramatically faster inserts compared to one-by-one inserts. Progress is logged every 50,000 records with count, elapsed time, and records/second throughput.
 
+### Way Centroid Resolution
+
+OSM ways (buildings, POIs, campuses, streets) carry no coordinates in the PBF format — only references to member nodes. After the row import, three crash-resumable passes over the extract give every indexed way a real centroid: (1) a bloom filter collects the node IDs referenced by indexed ways, (2) those nodes' coordinates are stored in a temporary table (~6-8GB for the US extract, dropped afterwards), and (3) each way's centroid is computed and applied in committed chunks. On existing databases this runs once as a backfill on startup.
+
+The bloom filter uses `WAY_COORDS_BLOOM_MB` of RAM (default 256) during one pass. The whole phase can be disabled with `WAY_COORDS_ENABLED=false` — but way rows then keep `lat/lon = 0`, making them unplottable and invisible to `bbox` filtering and reverse geocoding.
+
 ## Admin Access
 
 To view and manage geocoder data from the PocketBase admin UI:
@@ -136,6 +147,19 @@ All endpoints are under `/api/geocoder/` and return JSON with a `results` array 
 #### `GET /api/geocoder/search`
 
 Full-text search for places and addresses.
+
+Matching is tiered: the strict interpretation of the query runs first (all
+tokens in one record), and only when that returns nothing does a **ranked
+partial match** kick in — the same approach Photon uses. This is what makes
+institution-style queries work, where the place named spans multiple OSM
+features:
+
+```bash
+# "Bowdoin College" (a campus) and "Roux Center for the Environment" (a
+# building) are separate OSM features; no single record contains every token.
+# Partial matching returns the best candidates instead of nothing.
+curl "http://127.0.0.1:8090/api/geocoder/search?q=Bowdoin+College+Roux+Center"
+```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -268,11 +292,11 @@ Each result in the `results` array contains:
 | `state` | string | State abbreviation (populated for address nodes) |
 | `postcode` | string | Postal code (populated for address nodes) |
 | `country` | string | Country name |
-| `lat` | float | Latitude (0 for ways without resolved coordinates) |
-| `lon` | float | Longitude (0 for ways without resolved coordinates) |
-| `class` | string | OSM class category |
-| `type` | string | OSM type within class |
-| `importance` | float | Search importance ranking |
+| `lat` | float | Latitude (ways: centroid of member nodes; 0 only for ways clipped at extract borders) |
+| `lon` | float | Longitude (ways: centroid of member nodes; 0 only for ways clipped at extract borders) |
+| `class` | string | OSM class derived from tags, e.g. `amenity`, `building`, `shop` (may be empty) |
+| `type` | string | OSM type within the class, e.g. `university`, `college` (may be empty) |
+| `importance` | float | Coarse importance score: settlements > named POIs > streets > addresses |
 | `created` | string | Record creation timestamp |
 | `updated` | string | Record last-update timestamp |
 

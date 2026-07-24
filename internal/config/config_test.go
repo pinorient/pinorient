@@ -10,6 +10,8 @@ func TestLoadImportDefaults(t *testing.T) {
 	t.Setenv("IMPORT_BATCH_SIZE", "")
 	t.Setenv("OSM_DECODER_WORKERS", "")
 	t.Setenv("SERIALIZE_IMPORTS", "")
+	t.Setenv("WAY_COORDS_ENABLED", "")
+	t.Setenv("WAY_COORDS_BLOOM_MB", "")
 
 	cfg := Load()
 
@@ -31,6 +33,12 @@ func TestLoadImportDefaults(t *testing.T) {
 	if !cfg.SerializeImports {
 		t.Error("SerializeImports should default to true")
 	}
+	if !cfg.WayCoordsEnabled {
+		t.Error("WayCoordsEnabled should default to true")
+	}
+	if cfg.WayCoordsBloomMB != 256 {
+		t.Errorf("WayCoordsBloomMB = %d, want 256", cfg.WayCoordsBloomMB)
+	}
 }
 
 func TestLoadImportOverrides(t *testing.T) {
@@ -38,6 +46,8 @@ func TestLoadImportOverrides(t *testing.T) {
 	t.Setenv("TIGER_KEEP_DATA", "1")
 	t.Setenv("OSM_KEEP_DATA", "false")
 	t.Setenv("IMPORT_BATCH_SIZE", "5000")
+	t.Setenv("WAY_COORDS_ENABLED", "false")
+	t.Setenv("WAY_COORDS_BLOOM_MB", "512")
 
 	cfg := Load()
 
@@ -52,5 +62,11 @@ func TestLoadImportOverrides(t *testing.T) {
 	}
 	if cfg.ImportBatchSize != 5000 {
 		t.Errorf("ImportBatchSize = %d, want 5000", cfg.ImportBatchSize)
+	}
+	if cfg.WayCoordsEnabled {
+		t.Error("WayCoordsEnabled should be false when WAY_COORDS_ENABLED=false")
+	}
+	if cfg.WayCoordsBloomMB != 512 {
+		t.Errorf("WayCoordsBloomMB = %d, want 512", cfg.WayCoordsBloomMB)
 	}
 }

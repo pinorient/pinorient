@@ -3,6 +3,8 @@ package geocoder
 import (
 	"strings"
 	"testing"
+
+	"github.com/pinorient/pinorient/internal/models"
 )
 
 func TestBuildMultiValueInsert(t *testing.T) {
@@ -107,6 +109,102 @@ func TestSplitContextState(t *testing.T) {
 		if city != c.city || state != c.state {
 			t.Errorf("splitContextState(%q) = (%q, %q), want (%q, %q)", c.in, city, state, c.city, c.state)
 		}
+	}
+}
+
+func TestFTSTokens(t *testing.T) {
+	got := ftsTokens("  Bowdoin  \"College\"  Roux ")
+	want := []string{"Bowdoin", "College", "Roux"}
+	if len(got) != len(want) {
+		t.Fatalf("ftsTokens = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("ftsTokens[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if got := ftsTokens("   "); len(got) != 0 {
+		t.Errorf("ftsTokens(blank) = %v, want empty", got)
+	}
+}
+
+func TestBuildAndQuery(t *testing.T) {
+	got := buildAndQuery([]string{"bowdoin", "college", "a"})
+	want := `"bowdoin" AND "college"` // 1-char token skipped
+	if got != want {
+		t.Errorf("buildAndQuery = %q, want %q", got, want)
+	}
+	if got := buildAndQuery(nil); got != "" {
+		t.Errorf("buildAndQuery(nil) = %q, want empty", got)
+	}
+}
+
+func TestBuildOrQuery(t *testing.T) {
+	cases := []struct {
+		name       string
+		tokens     []string
+		prefixLast bool
+		want       string
+	}{
+		{"exact", []string{"bowdoin", "college", "roux", "center"}, false,
+			`"bowdoin" OR "college" OR "roux" OR "center"`},
+		{"prefix on short last token", []string{"bowdoin", "college", "cent"}, true,
+			`"bowdoin" OR "college" OR cent*`},
+		{"no prefix on long last token", []string{"bowdoin", "college", "center"}, true,
+			`"bowdoin" OR "college" OR "center"`},
+		{"short tokens skipped", []string{"a", "bb", "ccc"}, false, `"ccc"`},
+		{"empty", nil, false, ""},
+	}
+	for _, c := range cases {
+		if got := buildOrQuery(c.tokens, c.prefixLast); got != c.want {
+			t.Errorf("%s: buildOrQuery(%v, %v) = %q, want %q", c.name, c.tokens, c.prefixLast, got, c.want)
+		}
+	}
+}
+
+func TestPreferMultiTokenMatches(t *testing.T) {
+	tokens := []string{"bowdoin", "college", "roux", "center"}
+	candidates := []models.Place{
+		{Name: "Some Center"}, // single-token match only
+		{Name: "Roux Center for the Environment", Address: "44 College Street", City: "Brunswick", State: "ME"}, // 3 hits
+		{Name: "Bowdoin College"}, // 2 hits
+	}
+
+	got := preferMultiTokenMatches(candidates, tokens, 10)
+	if len(got) != 3 {
+		t.Fatalf("preferMultiTokenMatches returned %d places, want 3", len(got))
+	}
+	// Multi-token matches first (preserving their original rank order),
+	// single-token matches fill the tail.
+	if got[0].Name != "Roux Center for the Environment" {
+		t.Errorf("got[0] = %q, want the 3-token match first", got[0].Name)
+	}
+	if got[1].Name != "Bowdoin College" {
+		t.Errorf("got[1] = %q, want the 2-token match second", got[1].Name)
+	}
+	if got[2].Name != "Some Center" {
+		t.Errorf("got[2] = %q, want the single-token match last", got[2].Name)
+	}
+
+	// Limit truncation applies after reordering.
+	got = preferMultiTokenMatches(candidates, tokens, 1)
+	if len(got) != 1 || got[0].Name != "Roux Center for the Environment" {
+		t.Errorf("limit=1: got %v, want only the best multi-token match", got)
+	}
+}
+
+func TestTokenHits(t *testing.T) {
+	p := &models.Place{
+		Name: "Roux Center for the Environment", Address: "44 College Street",
+		City: "Brunswick", State: "ME", Postcode: "04011",
+	}
+	hits := tokenHits(p, []string{"roux", "center", "college", "bowdoin", "brunswick"})
+	if hits != 4 {
+		t.Errorf("tokenHits = %d, want 4 (bowdoin must not match)", hits)
+	}
+	// Case-insensitive, substring (prefix) matching.
+	if hits := tokenHits(p, []string{"ROUX", "cent"}); hits != 2 {
+		t.Errorf("tokenHits case/prefix = %d, want 2", hits)
 	}
 }
 
