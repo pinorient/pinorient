@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/qedus/osmpbf"
@@ -64,6 +65,14 @@ func (s *Scheduler) resolveWayCoords(ctx context.Context, path string) error {
 	bloomPath := filepath.Join(s.cfg.OSMDataPath, "way_nodes.bloom")
 
 	if nodeCoordsDone != "done" {
+		// The coordinate table plus WAL need several GB of scratch space.
+		// Refuse to start when the disk cannot hold it: a full disk does
+		// not just fail the import, it wedges SQLite for every request.
+		if free, err := freeBytes(s.cfg.OSMDataPath); err == nil && free < wayCoordsMinFreeBytes {
+			return fmt.Errorf("insufficient disk space for way coordinate resolution: %.1fGB free, need ~%dGB; free space or set WAY_COORDS_ENABLED=false",
+				float64(free)/(1<<30), wayCoordsMinFreeBytes>>30)
+		}
+
 		bloom, err := s.buildWayNodeBloom(ctx, path, bloomPath)
 		if err != nil {
 			return err
@@ -214,6 +223,12 @@ func (s *Scheduler) collectNodeCoords(ctx context.Context, pbfPath string, bloom
 			if err := flush(); err != nil {
 				return err
 			}
+			// Checkpoint periodically so the WAL does not grow unbounded
+			// over hundreds of millions of inserts (a full disk wedges the
+			// whole server). No-op if another connection holds the lock.
+			if kept%50000000 < coordFlushSize {
+				s.geo.Checkpoint(ctx)
+			}
 			if kept%10000000 < coordFlushSize {
 				log.Printf("way coords: node progress: scanned=%d kept=%d elapsed=%s",
 					scanned, kept, time.Since(startTime).Round(time.Second))
@@ -311,6 +326,11 @@ func (s *Scheduler) applyWayCentroids(ctx context.Context, pbfPath string) error
 		updatesApplied += int64(len(updates))
 		chunksCommitted++
 		chunk = chunk[:0]
+		// Checkpoint every 500 chunks (~1M way updates) so the WAL stays
+		// bounded over the ~40M-update pass (a full disk wedges the server).
+		if chunksCommitted%500 == 0 {
+			s.geo.Checkpoint(ctx)
+		}
 		return nil
 	}
 
@@ -375,6 +395,21 @@ func centroidOf(nodeIDs []int64, coords map[int64][2]float64) (lat, lon float64,
 		return 0, 0, false
 	}
 	return sumLat / float64(n), sumLon / float64(n), true
+}
+
+// wayCoordsMinFreeBytes is the free disk space required before the node
+// coordinate collection may start: ~7GB for the coordinate table of the US
+// extract plus WAL headroom for the update pass.
+const wayCoordsMinFreeBytes = 12 << 30 // 12GiB
+
+// freeBytes returns the number of bytes available to unprivileged users on
+// the filesystem holding path.
+func freeBytes(path string) (uint64, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, err
+	}
+	return st.Bavail * uint64(st.Bsize), nil
 }
 
 // decodePBF opens path and starts an osmpbf decoder with the configured
