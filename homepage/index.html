@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pinorient — a pure Go / SQLite geocoder</title>
+<meta name="description" content="pinorient is a lightweight, self-hosted geocoder built on PocketBase, SQLite FTS5, and OpenStreetMap data.">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0; line-height: 1.6;
+    display: flex; flex-direction: column; min-height: 100vh;
+  }
+  main { flex: 1; width: 100%; max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem; }
+  h1 { font-size: 2.25rem; margin: 0 0 .25rem; }
+  .tagline { font-size: 1.15rem; opacity: .8; margin: 0 0 2rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.25rem; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre {
+    background: rgba(127,127,127,.12); padding: .9rem 1rem; border-radius: 8px;
+    overflow-x: auto; font-size: .9rem;
+  }
+  code { background: rgba(127,127,127,.12); padding: .1em .35em; border-radius: 4px; }
+  pre code { background: none; padding: 0; }
+  ul { padding-left: 1.25rem; }
+  a.button {
+    display: inline-block; padding: .65rem 1.2rem; border-radius: 8px;
+    background: #2563eb; color: #fff; text-decoration: none; font-weight: 600;
+    margin-right: .5rem; margin-top: .5rem;
+  }
+  a.button.secondary { background: transparent; border: 1px solid currentColor; color: inherit; }
+  footer { text-align: center; padding: 1.5rem; opacity: .6; font-size: .9rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>📍 pinorient</h1>
+  <p class="tagline">A pure Go / SQLite geocoder built on PocketBase and OpenStreetMap data.</p>
+
+  <p>
+    <strong>pinorient</strong> translates written addresses into map coordinates using
+    OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is a
+    lightweight, self-hosted alternative to the Photon API — no Java, no Elasticsearch,
+    no Docker orchestration. One static binary, one SQLite database.
+  </p>
+
+  <p>
+    <a class="button" href="https://github.com/pinorient/pinorient">View on GitHub</a>
+    <a class="button secondary" href="/api/geocoder/search?q=Boston&limit=1">Try the API</a>
+  </p>
+
+  <h2>Features</h2>
+  <ul>
+    <li>Forward geocoding (<code>/api/geocoder/search?q=...</code>) and autocomplete</li>
+    <li>Reverse geocoding (<code>/api/geocoder/reverse?lat=...&amp;lon=...</code>)</li>
+    <li>Ranked partial matching across multiple features</li>
+    <li>US address interpolation via TIGER/Line data</li>
+    <li>Bounding-box filtering and wildcard domain restrictions</li>
+    <li>Photon-style class/type and importance scoring</li>
+    <li>Periodic OSM data refresh via cron</li>
+    <li>Tuned to run a full US import on a 2&nbsp;GB VPS</li>
+  </ul>
+
+  <h2>Quick start</h2>
+  <pre><code>git clone https://github.com/pinorient/pinorient
+cd pinorient
+make run   # builds and starts the server; OSM data downloads automatically</code></pre>
+
+  <p>
+    The server starts immediately and indexes OpenStreetMap data in the background.
+    See the <a href="https://github.com/pinorient/pinorient#readme">README</a> for
+    configuration options and API documentation.
+  </p>
+
+  <h2>API example</h2>
+  <pre><code>curl "http://localhost:8090/api/geocoder/search?q=Bowdoin%20College&limit=3"</code></pre>
+</main>
+<footer>
+  Open source · <a href="https://github.com/pinorient/pinorient">github.com/pinorient/pinorient</a>
+</footer>
+</body>
+</html>

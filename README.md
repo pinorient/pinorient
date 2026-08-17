@@ -27,7 +27,10 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 
 ```
 .
-├── cmd/pinorient/        # Application entrypoint
+├── pinorient.go          # Public library API: New(), Setup(), options
+├── setup.go              # Route/migration/scheduler wiring (library internals)
+├── homepage/             # Embedded static homepage served at /
+├── cmd/pinorient/        # Application entrypoint (thin main)
 ├── internal/
 │   ├── api/                # HTTP routes and middleware
 │   ├── config/             # Environment-based configuration
@@ -40,6 +43,34 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 ├── .gitignore
 └── README.md
 ```
+
+## Embedding as a library
+
+pinorient can be imported as a Go library and embedded into a larger
+PocketBase application — this is how the hosted service at pinorient.com is
+built, for example:
+
+```go
+app := pinorient.New() // pragma-tuned PocketBase instance
+
+err := pinorient.Setup(app,
+    // optional overrides:
+    pinorient.WithDomainChecker(myChecker),  // custom per-request domain logic
+    pinorient.WithMiddleware(myRateLimiter), // extra /api/geocoder middleware
+    pinorient.WithHomepage(myFS),            // custom static homepage
+    // pinorient.WithoutHomepage(),          // or disable it entirely
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// register your own routes here, then:
+app.Start()
+```
+
+The default behavior is identical to running the standalone binary: the
+homepage is served at `/`, `ALLOWED_DOMAINS` is enforced, and OSM/TIGER
+indexing starts in the background.
 
 ## Configuration
 
