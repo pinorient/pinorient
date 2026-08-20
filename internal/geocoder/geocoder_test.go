@@ -1,6 +1,7 @@
 package geocoder
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -306,5 +307,30 @@ func TestNormalizeStreetName(t *testing.T) {
 		if got := normalizeStreetName(c.in); got != c.want {
 			t.Errorf("normalizeStreetName(%q) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+func TestReverseBoxes(t *testing.T) {
+	boxes := reverseBoxes(0)
+	if len(boxes) != 4 {
+		t.Fatalf("expected 4 boxes, got %d", len(boxes))
+	}
+	// At the equator the box is square: dLat == dLon, ~0.5km for the first.
+	if math.Abs(boxes[0][0]-0.5/111.0) > 1e-9 || math.Abs(boxes[0][0]-boxes[0][1]) > 1e-12 {
+		t.Errorf("equator box should be square ~0.5km, got %v", boxes[0])
+	}
+	// Boxes must be strictly widening.
+	for i := 1; i < len(boxes); i++ {
+		if boxes[i][0] <= boxes[i-1][0] {
+			t.Errorf("boxes not widening at %d: %v", i, boxes)
+		}
+	}
+	// Near the poles the lon delta widens but stays bounded by the cos floor.
+	pole := reverseBoxes(89)
+	if pole[0][1] <= boxes[0][1] {
+		t.Errorf("expected wider lon delta near poles, got %v vs %v", pole[0][1], boxes[0][1])
+	}
+	if pole[0][1] > 0.5/(111.0*0.1)+1e-9 {
+		t.Errorf("lon delta should be capped by cos floor 0.1, got %v", pole[0][1])
 	}
 }

@@ -819,25 +819,56 @@ func (g *Geocoder) Reverse(ctx context.Context, lat, lon float64, limit int) ([]
 		return nil, fmt.Errorf("db is not available")
 	}
 
-	// Approximate nearest-neighbor using Haversine-like distance via simple lat/lon delta.
+	// Nearest-neighbor lookup. The bounding-box pre-filter (backed by the
+	// lat/lon indexes) keeps the scan small — the table holds millions of
+	// rows, so ordering the whole table by distance would take minutes.
+	// The box widens progressively until something nearby is found.
 	query := `
 		SELECT id, osm_id, osm_type, name, address, city, state, postcode, country,
-		       lat, lon, class, type, importance, created, updated,
-		       ((lat - {:lat}) * (lat - {:lat}) + (lon - {:lon}) * (lon - {:lon})) AS dist
+		       lat, lon, class, type, importance, created, updated
 		FROM geocoder_places
-		ORDER BY dist
+		WHERE lat BETWEEN {:minLat} AND {:maxLat}
+		  AND lon BETWEEN {:minLon} AND {:maxLon}
+		ORDER BY ((lat - {:lat}) * (lat - {:lat}) + (lon - {:lon}) * (lon - {:lon}))
+		LIMIT {:limit}
 	`
 
+	// cos(latitude) correction keeps the box roughly square in kilometers.
 	var places []models.Place
-	if err := db.
-		NewQuery(query).
-		Bind(dbx.Params{"lat": lat, "lon": lon, "limit": limit}).
-		All(&places); err != nil {
-		return nil, fmt.Errorf("reverse geocoding failed: %w", err)
+	for _, b := range reverseBoxes(lat) {
+		if err := db.
+			NewQuery(query).
+			Bind(dbx.Params{
+				"lat": lat, "lon": lon,
+				"minLat": lat - b[0], "maxLat": lat + b[0],
+				"minLon": lon - b[1], "maxLon": lon + b[1],
+				"limit":  limit,
+			}).
+			All(&places); err != nil {
+			return nil, fmt.Errorf("reverse geocoding failed: %w", err)
+		}
+		if len(places) > 0 {
+			break
+		}
 	}
 
 	g.enrichFromZipCache(ctx, places)
 	return places, nil
+}
+
+// reverseBoxes returns progressively wider (dLat, dLon) deltas around a
+// latitude, roughly 0.5km, 5km, 50km, and 500km square. The longitude delta
+// is widened by 1/cos(lat) so the box stays square in kilometers.
+func reverseBoxes(lat float64) [][2]float64 {
+	cosLat := math.Cos(lat * math.Pi / 180)
+	if cosLat < 0.1 {
+		cosLat = 0.1
+	}
+	boxes := make([][2]float64, 0, 4)
+	for _, km := range []float64{0.5, 5, 50, 500} {
+		boxes = append(boxes, [2]float64{km / 111.0, km / (111.0 * cosLat)})
+	}
+	return boxes
 }
 
 // enrichFromZipCache fills empty City/State fields on search results from the

@@ -88,6 +88,11 @@ func RunMigrations(app core.App) error {
 		// Created here at startup rather than lazily in request handlers,
 		// where the write lock would stall behind import transactions.
 		`CREATE VIRTUAL TABLE IF NOT EXISTS geocoder_places_fts_vocab USING fts5vocab('geocoder_places_fts', 'row')`,
+
+		// Coordinate indexes for the reverse-geocoding bounding-box pre-filter.
+		// Without these, every reverse lookup full-scans geocoder_places.
+		`CREATE INDEX IF NOT EXISTS idx_places_lat ON geocoder_places (lat)`,
+		`CREATE INDEX IF NOT EXISTS idx_places_lon ON geocoder_places (lon)`,
 	}
 	for _, q := range ftsQueries {
 		if _, err := db.NewQuery(q).Execute(); err != nil {
@@ -374,6 +379,8 @@ func createGeocoderPlacesCollection() *core.Collection {
 	c.AddIndex("idx_places_city", false, "city", "")
 	c.AddIndex("idx_places_state", false, "state", "")
 	c.AddIndex("idx_places_postcode", false, "postcode", "")
+	c.AddIndex("idx_places_lat", false, "lat", "")
+	c.AddIndex("idx_places_lon", false, "lon", "")
 
 	return c
 }
