@@ -6,6 +6,28 @@ A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and Op
 
 `pinorient` translates written addresses into map coordinates using OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is designed as a lightweight, self-hosted alternative to the Photon API, avoiding the overhead of Java, Elasticsearch, and Docker orchestration.
 
+## Quickstart
+
+> [!IMPORTANT]
+> Build — note: the main package lives in `./cmd/pinorient`. A plain `go build` at the repo root compiles only the library package and produces NO binary
+
+```bash
+# Build
+go build -o pinorient ./cmd/pinorient
+# Run
+./pinorient serve
+
+# Or simply: make run
+```
+
+On first startup the server downloads and indexes an OSM extract (several GB —
+this takes a while; progress is logged). On existing databases, startup
+migrations/backfills may also delay the "Server started" message. Once
+running:
+- the homepage is at `http://127.0.0.1:8090/`
+- the admin UI at `http://127.0.0.1:8090/_/`
+- run queries like `http://127.0.0.1:8090/api/geocoder/search?q=Boston&limit=1`
+
 ## Features
 
 - PocketBase (v0.39.0+) extended as a Go framework
@@ -161,15 +183,7 @@ To view and manage geocoder data from the PocketBase admin UI:
 
 Then navigate to `http://127.0.0.1:8090/_/` and log in. The `geocoder_places` collection will appear in the collections list, where you can browse, search, and manage records.
 
-## Usage
-
-```bash
-# Build
-go build .
-
-# Run
-./pinorient serve
-```
+## API Usage
 
 ### API Endpoints
 

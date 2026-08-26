@@ -5,59 +5,122 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pinorient — a pure Go / SQLite geocoder</title>
 <meta name="description" content="pinorient is a lightweight, self-hosted geocoder built on PocketBase, SQLite FTS5, and OpenStreetMap data.">
+<link rel="icon" type="image/svg+xml" href="/static/pinorient.svg">
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa; --surface: #ffffff; --border: #e5e5e5;
+    --text: #171717; --text-muted: #737373;
+    --primary: #333333; --primary-hover: #000000; --primary-text: #ffffff;
+    --primary-soft: #f0f0f0;
+    --link: #525252;
+    --radius: 12px;
+    --shadow: 0 1px 3px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0a0a0a; --surface: #141414; --border: #262626;
+      --text: #f5f5f5; --text-muted: #a3a3a3;
+      --primary: #f5f5f5; --primary-hover: #ffffff; --primary-text: #171717;
+      --primary-soft: #1f1f1f;
+      --link: #a3a3a3;
+      --shadow: 0 1px 3px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
   * { box-sizing: border-box; }
   body {
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    margin: 0; line-height: 1.6;
+    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0; line-height: 1.6; background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased;
     display: flex; flex-direction: column; min-height: 100vh;
   }
+  a { color: var(--link); }
+  a:hover { color: var(--text); }
+
+  /* Subtle map-like grid in the gutters, fading out toward the content. */
+  body::before {
+    content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    background-image:
+      radial-gradient(circle, var(--text) 1px, transparent 1.6px),
+      repeating-linear-gradient(45deg, var(--text) 0 1px, transparent 1px 46px),
+      repeating-linear-gradient(-45deg, var(--text) 0 1px, transparent 1px 46px);
+    background-size: 26px 26px, auto, auto;
+    opacity: .05;
+    -webkit-mask-image: linear-gradient(to right, #000 0, transparent 34vw, transparent 66vw, #000 100%);
+    mask-image: linear-gradient(to right, #000 0, transparent 34vw, transparent 66vw, #000 100%);
+  }
+
   main { flex: 1; width: 100%; max-width: 46rem; margin: 0 auto; padding: 3rem 1.25rem; }
-  h1 { font-size: 2.25rem; margin: 0 0 .25rem; }
-  .tagline { font-size: 1.15rem; opacity: .8; margin: 0 0 2rem; }
-  h2 { font-size: 1.2rem; margin-top: 2.25rem; }
+  h1 { display: flex; align-items: center; gap: .75rem; font-size: 2.25rem; letter-spacing: -.02em; margin: 0 0 .25rem; }
+  h1 img { width: 44px; height: 44px; }
+  @media (prefers-color-scheme: dark) { h1 img { filter: invert(1); } }
+  .tagline { font-size: 1.15rem; color: var(--text-muted); margin: 0 0 2rem; }
+  h2 { font-size: 1.2rem; margin-top: 2.25rem; letter-spacing: -.01em; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  code { background: var(--primary-soft); padding: .1em .35em; border-radius: 4px; font-size: .9em; }
   pre {
-    background: rgba(127,127,127,.12); padding: .9rem 1rem; border-radius: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    padding: .9rem 1rem; border-radius: var(--radius); box-shadow: var(--shadow);
     overflow-x: auto; font-size: .9rem;
   }
-  code { background: rgba(127,127,127,.12); padding: .1em .35em; border-radius: 4px; }
-  pre code { background: none; padding: 0; }
+  pre code { background: none; padding: 0; font-size: inherit; }
   ul { padding-left: 1.25rem; }
+
   a.button {
     display: inline-block; padding: .65rem 1.2rem; border-radius: 8px;
-    background: #2563eb; color: #fff; text-decoration: none; font-weight: 600;
+    background: var(--primary); color: var(--primary-text);
+    text-decoration: none; font-weight: 600;
     margin-right: .5rem; margin-top: .5rem;
+    transition: background .15s, transform .05s;
   }
-  a.button.secondary { background: transparent; border: 1px solid currentColor; color: inherit; }
-  footer { text-align: center; padding: 1.5rem; opacity: .6; font-size: .9rem; }
+  a.button:hover { background: var(--primary-hover); color: var(--primary-text); }
+  a.button:active { transform: translateY(1px); }
+  a.button.secondary {
+    background: transparent; color: var(--text);
+    border: 1px solid var(--border);
+  }
+  a.button.secondary:hover { background: var(--primary-soft); color: var(--text); }
+
+  .cta-band {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    text-align: center; padding: 2.25rem 1.5rem; margin-top: 2.5rem;
+  }
+  .cta-band h2 { margin-top: 0; }
+  .cta-band p { color: var(--text-muted); margin: 0 0 1.5rem; }
+
+  footer { text-align: center; padding: 1.5rem; color: var(--text-muted); font-size: .9rem; }
 </style>
 </head>
 <body>
 <main>
-  <h1>📍 pinorient</h1>
+  <h1><img src="/static/pinorient.svg" alt=""> pinorient</h1>
   <p class="tagline">A pure Go / SQLite geocoder built on PocketBase and OpenStreetMap data.</p>
 
   <p>
-    <strong>pinorient</strong> translates written addresses into map coordinates using
+    <strong>Pinorient</strong> translates written addresses into map coordinates using
     OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is a
     lightweight, self-hosted alternative to the Photon API — no Java, no Elasticsearch,
     no Docker orchestration. One static binary, one SQLite database.
   </p>
 
   <p>
-    <a class="button" href="https://github.com/pinorient/pinorient">View on GitHub</a>
-    <a class="button secondary" href="/api/geocoder/search?q=Boston&limit=1">Try the API</a>
+    <a class="button" href="https://github.com/pinorient/pinorient" target="_blank" rel="noopener">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+      GitHub
+    </a>
+    <a class="button secondary" href="https://pinorient.com" target="_blank" rel="noopener">Hosted Service</a>
   </p>
 
   <h2>Features</h2>
   <ul>
-    <li>Forward geocoding (<code>/api/geocoder/search?q=...</code>) and autocomplete</li>
+    <li>Forward geocoding (<code>/api/geocoder/search?q=...</code>)</li>
+    <li>Autocomplete (<code>/api/geocoder/autocomplete?q=...</code>)</li>
     <li>Reverse geocoding (<code>/api/geocoder/reverse?lat=...&amp;lon=...</code>)</li>
+    <li>Bounding-box filtering and result limits (<code>/api/geocoder/autocomplete?q=12+Englewood+Ave&bbox=-73.5,41.3,-72.8,41.6&limit=5</code>)</li>
     <li>Ranked partial matching across multiple features</li>
     <li>US address interpolation via TIGER/Line data</li>
-    <li>Bounding-box filtering and wildcard domain restrictions</li>
+    <li>Wildcard domain restrictions</li>
     <li>Photon-style class/type and importance scoring</li>
     <li>Periodic OSM data refresh via cron</li>
     <li>Tuned to run a full US import on a 2&nbsp;GB VPS</li>
@@ -69,16 +132,27 @@ cd pinorient
 make run   # builds and starts the server; OSM data downloads automatically</code></pre>
 
   <p>
-    The server starts immediately and indexes OpenStreetMap data in the background.
-    See the <a href="https://github.com/pinorient/pinorient#readme">README</a> for
+    Starts the server and indexes OpenStreetMap data in the background (initial startup downloads and indexes several GB of data and may takes several minutes to complete).
+    See the <a href="https://github.com/pinorient/pinorient#readme" target="_blank" rel="noopener">README</a> for
     configuration options and API documentation.
   </p>
 
   <h2>API example</h2>
-  <pre><code>curl "http://localhost:8090/api/geocoder/search?q=Bowdoin%20College&limit=3"</code></pre>
+  <pre><code>curl "http://localhost:8090/api/geocoder/search?q=Bowdoin%20College&amp;limit=3"</code></pre>
+  <a class="button secondary" href="/api/geocoder/search?q=Boston&amp;limit=1">Explore the API</a>
+
+  <div class="cta-band">
+    <h2>Don't want to self-host?</h2>
+    <p>Skip the server entirely — <strong>pinorient.com</strong> is the hosted version of this geocoder.<br>
+      Subscribe for a fraction of Google's API cost; seamlessly switch to self-hosting any time.</p>
+    <a class="button" href="https://pinorient.com" target="_blank" rel="noopener">Try the hosted service</a>
+  </div>
 </main>
 <footer>
-  Open source · <a href="https://github.com/pinorient/pinorient">github.com/pinorient/pinorient</a>
+  Open source ·
+  <a href="https://github.com/pinorient/pinorient" target="_blank" rel="noopener" style="display:inline-flex; align-items:center; gap:.35rem; vertical-align:middle;">
+    <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+    github.com/pinorient/pinorient
+  </a>
 </footer>
 </body>
-</html>
