@@ -1,32 +1,40 @@
-# pinorient
+# Pinorient
 
 A pure Go / SQLite geocoder built on [PocketBase](https://pocketbase.io/) and OpenStreetMap (OSM) data.
 
 ## Overview
 
-`pinorient` translates written addresses into map coordinates using OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is designed as a lightweight, self-hosted alternative to the Photon API, avoiding the overhead of Java, Elasticsearch, and Docker orchestration.
+Pinorient translates written addresses into map coordinates using OpenStreetMap data stored locally in SQLite with FTS5 full-text search. It is designed as a lightweight, self-hosted alternative to the Photon API, avoiding the overhead of Java, Elasticsearch, and Docker orchestration.
+
+**Don't want to manage your own server?** Check out our hosted platform at [pinorient.com](https://pinorient.com).
 
 ## Quickstart
 
 > [!IMPORTANT]
-> Build — note: the main package lives in `./cmd/pinorient`. A plain `go build` at the repo root compiles only the library package and produces NO binary
+> The main package lives in `./cmd/pinorient`
+>
+> A plain `go build` at the repo root compiles only the library package and produces NO binary
 
 ```bash
 # Build
 go build -o pinorient ./cmd/pinorient
 # Run
 ./pinorient serve
+```
 
-# Or simply: make run
+Or build & run with a single command: 
+
+```bash
+make run
 ```
 
 On first startup the server downloads and indexes an OSM extract (several GB —
 this takes a while; progress is logged). On existing databases, startup
 migrations/backfills may also delay the "Server started" message. Once
 running:
-- the homepage is at `http://127.0.0.1:8090/`
-- the admin UI at `http://127.0.0.1:8090/_/`
-- run queries like `http://127.0.0.1:8090/api/geocoder/search?q=Boston&limit=1`
+- The homepage is at `http://127.0.0.1:8090/`
+- The admin UI at `http://127.0.0.1:8090/_/`
+- Run queries like `http://127.0.0.1:8090/api/geocoder/search?q=Boston&limit=1`
 
 ## Features
 
@@ -54,15 +62,18 @@ running:
 ├── homepage/             # Embedded static homepage served at /
 ├── cmd/pinorient/        # Application entrypoint (thin main)
 ├── internal/
-│   ├── api/                # HTTP routes and middleware
-│   ├── config/             # Environment-based configuration
-│   ├── db/                 # Schema migrations (PocketBase collection + FTS5)
-│   ├── geocoder/           # Search / reverse / indexing logic
-│   ├── models/             # Data models
-│   └── osm/                # OSM PBF parsing and refresh scheduler
+│   ├── api/              # HTTP routes and middleware
+│   ├── config/           # Environment-based configuration
+│   ├── db/               # Schema migrations (PocketBase collection + FTS5)
+│   ├── geocoder/         # Search / reverse / indexing logic
+│   ├── models/           # Data models
+│   └── osm/              # OSM PBF parsing and refresh scheduler
 ├── go.mod
 ├── go.sum
 ├── .gitignore
+├── .env.example          # Example config file for environment variables
+├── Makefile              # Helpers for building/running/testing the app
+├── LICENSE
 └── README.md
 ```
 
