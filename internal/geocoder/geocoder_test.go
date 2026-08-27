@@ -8,6 +8,25 @@ import (
 	"github.com/pinorient/pinorient/internal/models"
 )
 
+func TestSanitizeQuery(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"  ", ""},
+		{"42 Maple St", "42 Maple St"},
+		{"42 Maple St, Springfield", "42 Maple St Springfield"},
+		{"42 Maple St , Springfield , MA", "42 Maple St Springfield MA"},
+		{"42 Maple St, Springfield, MA 01103", "42 Maple St Springfield MA 01103"},
+		{"42 Maple St; Springfield", "42 Maple St Springfield"},
+		{",,,", ""},
+		{"42  Maple   St", "42 Maple St"},
+	}
+	for _, c := range cases {
+		if got := sanitizeQuery(c.in); got != c.want {
+			t.Errorf("sanitizeQuery(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestBuildMultiValueInsert(t *testing.T) {
 	rows := [][]any{
 		{"node/1", int64(1), "Main St"},
@@ -84,6 +103,7 @@ func TestSplitStreetContext(t *testing.T) {
 		{"broadway", "broadway", ""},
 		{"capitan rd", "capitan rd", ""},
 		{"maple street", "maple street", ""},
+		{"birchwood rd, capitan", "birchwood rd", "capitan"},
 		{"park ave new york", "park ave", "new york"},
 	}
 	for _, c := range cases {

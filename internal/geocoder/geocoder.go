@@ -153,6 +153,20 @@ func buildMultiValueInsert(head, rowSuffix, tail string, rows [][]any) (string, 
 	return sb.String(), params
 }
 
+// queryPunctReplacer turns punctuation that users commonly type between
+// address components into spaces. The FTS5 tokenizer already treats these
+// characters as token separators, so removing them loses no matching power;
+// keeping them, however, would glue punctuation to tokens ("st,") and break
+// street-suffix detection, vocab count lookups, and exact street-name
+// comparisons downstream.
+var queryPunctReplacer = strings.NewReplacer(",", " ", ";", " ")
+
+// sanitizeQuery normalizes a raw user query: punctuation becomes whitespace
+// and whitespace runs are collapsed.
+func sanitizeQuery(q string) string {
+	return strings.Join(strings.Fields(queryPunctReplacer.Replace(q)), " ")
+}
+
 // parseHouseNumber attempts to extract a leading house number from a query.
 // Returns the house number, the remaining street name, and true if a house
 // number was found. e.g., "42 Maple St" -> (42, "Maple St", true).
@@ -188,6 +202,7 @@ func (g *Geocoder) Search(ctx context.Context, q string, limit int, bbox *BBox) 
 	if limit <= 0 {
 		limit = 10
 	}
+	q = sanitizeQuery(q)
 
 	db := g.app.DB()
 	if db == nil {
@@ -251,6 +266,7 @@ func (g *Geocoder) Autocomplete(ctx context.Context, q string, limit int, bbox *
 	if limit <= 0 {
 		limit = 10
 	}
+	q = sanitizeQuery(q)
 
 	db := g.app.DB()
 	if db == nil {
@@ -1975,10 +1991,13 @@ var likeWildcardReplacer = strings.NewReplacer("%", "", "_", "")
 // string as the street and an empty context when no suffix boundary is found.
 func splitStreetContext(s string) (street, context string) {
 	tokens := strings.Fields(s)
+	for i := range tokens {
+		tokens[i] = strings.TrimRight(tokens[i], ".,")
+	}
 	// Start at index 1: a suffix as the very first token can't end the street
 	// name (e.g. "St Marys Rd" where "St" means "Saint").
 	for i := 1; i < len(tokens); i++ {
-		if usStreetSuffixes[strings.ToLower(strings.TrimRight(tokens[i], "."))] {
+		if usStreetSuffixes[strings.ToLower(tokens[i])] {
 			if i+1 < len(tokens) {
 				return strings.Join(tokens[:i+1], " "), strings.Join(tokens[i+1:], " ")
 			}
@@ -1996,11 +2015,14 @@ func splitContextState(context string) (city, state string) {
 	if len(tokens) == 0 {
 		return "", ""
 	}
-	last := strings.ToUpper(strings.TrimRight(tokens[len(tokens)-1], "."))
+	for i := range tokens {
+		tokens[i] = strings.TrimRight(tokens[i], ".,")
+	}
+	last := strings.ToUpper(tokens[len(tokens)-1])
 	if usStateAbbrevs[last] {
 		return strings.Join(tokens[:len(tokens)-1], " "), last
 	}
-	return context, ""
+	return strings.Join(tokens, " "), ""
 }
 
 // tigerAddrRow represents a row from the tiger_addr_ranges table.
